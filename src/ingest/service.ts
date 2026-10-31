@@ -217,7 +217,7 @@ export class IngestService {
       tenantId,
       documentId,
       ordinal,
-      heading: redactStatic(d.heading ? `${doc.title} > ${d.heading}` : doc.title),
+      heading: redactStatic(chunkHeading(doc.title, d.heading)),
       text: d.text,
       indexText: redactStatic(d.text),
     }));
@@ -238,4 +238,10 @@ export class IngestService {
     this.deps.retriever.commit(tenantId, documentId, chunks, vectors);
     this.documents.update(tenantId, documentId, { status: "ready", chunkCount: chunks.length, error: null, updatedAt: this.clock() });
   }
+}
+
+/** Heading shown with a chunk: the document title, then the section path (not repeating the title when the H1 already is it). */
+function chunkHeading(title: string, sectionPath: string): string {
+  if (!sectionPath) return title;
+  return sectionPath === title || sectionPath.startsWith(`${title} > `) ? sectionPath : `${title} > ${sectionPath}`;
 }

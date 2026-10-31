@@ -17,7 +17,7 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
-    "eval": "node dist/eval/run.js",
+    "eval": "npm run build --silent && node dist/eval/run.js",
     "start": "node dist/cli.js"
   },
   "keywords": [

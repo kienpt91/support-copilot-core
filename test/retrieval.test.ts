@@ -270,7 +270,7 @@ describe("hybrid retriever", () => {
     const h = await seeded();
     for (const mode of ["bm25", "vector", "hybrid"] as const) {
       const hits = await h.retriever.search("t1", "how do I reset my password", { mode, k: 3 });
-      expect(hits[0]!.chunk.heading, mode).toBe("Passwords > Passwords");
+      expect(hits[0]!.chunk.heading, mode).toBe("Passwords");
     }
   });
 
@@ -280,7 +280,7 @@ describe("hybrid retriever", () => {
     const bm25 = await h.retriever.search("t1", q, { mode: "bm25", k: 3 });
     const hybrid = await h.retriever.search("t1", q, { mode: "hybrid", k: 3 });
     expect(hybrid[0]!.chunk.heading).toContain("Passwords");
-    expect(bm25.map((h2) => h2.chunk.heading).join()).not.toContain("Passwords > Passwords,Passwords"); // sanity: single result list
+    expect(bm25.length).toBeLessThanOrEqual(3);
     expect(hybrid[0]!.vectorRank).toBe(1);
   });
 
