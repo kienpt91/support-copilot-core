@@ -16,6 +16,10 @@ export function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
 }
 
+export function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
 /** JSON with object keys sorted recursively, so the same value always hashes the same. */
 export function canonicalJson(value: unknown): string {
   return JSON.stringify(sortKeys(value));

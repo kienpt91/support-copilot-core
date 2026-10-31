@@ -1,3 +1,4 @@
+import { isRecord } from "../util.js";
 import { redactStatic } from "../privacy/pii.js";
 
 export interface Embedder {
@@ -145,13 +146,14 @@ export class OpenAiCompatibleEmbedder implements Embedder {
     } catch {
       throw new EmbedderError("embedding endpoint returned invalid JSON", false);
     }
-    const data = (payload as { data?: { index?: number; embedding?: unknown }[] } | null)?.data;
-    if (!Array.isArray(data) || data.length !== batch.length) {
+    const rows = isRecord(payload) ? payload.data : undefined;
+    if (!Array.isArray(rows) || rows.length !== batch.length) {
       throw new EmbedderError("embedding endpoint returned an unexpected number of vectors", false);
     }
-    const ordered = [...data].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+    const indexOf = (row: unknown) => (isRecord(row) && typeof row.index === "number" ? row.index : 0);
+    const ordered: unknown[] = [...rows].sort((a, b) => indexOf(a) - indexOf(b));
     return ordered.map((row) => {
-      const e = row.embedding;
+      const e = isRecord(row) ? row.embedding : undefined;
       if (!Array.isArray(e) || e.length !== this.dimensions || !e.every((x) => typeof x === "number" && Number.isFinite(x))) {
         throw new EmbedderError("embedding endpoint returned a malformed or wrongly sized vector", false);
       }

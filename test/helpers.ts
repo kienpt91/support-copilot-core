@@ -1,4 +1,6 @@
 import { MemoryAuditLog } from "../src/audit/chain.js";
+import { Core, type CoreOptions } from "../src/core.js";
+import { CORPUS } from "../src/eval/corpus.js";
 import { IngestService } from "../src/ingest/service.js";
 import { InMemoryJobQueue, type InMemoryQueueOptions } from "../src/ingest/queue.js";
 import { type Embedder, HashingEmbedder, RedactingEmbedder } from "../src/retrieval/embedder.js";
@@ -32,3 +34,39 @@ export async function settle(h: { queue: InMemoryJobQueue; clock: FakeClock }, r
     h.clock.advance(60_000);
   }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Whole-core helpers
+
+export interface TestTenant {
+  id: string;
+  owner: Actor;
+  admin: Actor;
+  agent: Actor;
+  publicKey: string;
+  ownerKey: string;
+}
+
+export function newCore(opts: CoreOptions = {}): { core: Core; clock: FakeClock } {
+  const clock = new FakeClock();
+  const core = new Core({ clock: clock.read, queueOptions: { backoffMs: (n) => 1000 * n }, ...opts });
+  return { core, clock };
+}
+
+export function newTenant(core: Core, name = "Acme", settings: Parameters<Core["createTenant"]>[0]["settings"] = {}): TestTenant {
+  const { tenant, ownerKey, publicKey } = core.createTenant({ name, settings });
+  const mk = (role: Actor["role"]): Actor => ({ tenantId: tenant.id, keyId: `${ownerKey.record.id}-${role}`, role });
+  return { id: tenant.id, owner: { tenantId: tenant.id, keyId: ownerKey.record.id, role: "owner" }, admin: mk("admin"), agent: mk("agent"), publicKey: publicKey.key, ownerKey: ownerKey.key };
+}
+
+export async function ingestCorpus(core: Core, tenant: TestTenant): Promise<Map<string, string>> {
+  const ids = new Map<string, string>();
+  for (const doc of CORPUS) {
+    ids.set(doc.id, core.ingest.submit(tenant.admin, { title: doc.title, content: doc.content, format: "markdown" }).document.id);
+  }
+  await core.queue.tick();
+  return ids;
+}
+
+export const widgetPrincipal = (t: TestTenant, keyId = "pk-test") => ({ tenantId: t.id, keyId, kind: "widget" as const });
+export const apiPrincipal = (t: TestTenant) => ({ tenantId: t.id, keyId: t.owner.keyId, kind: "api" as const });
