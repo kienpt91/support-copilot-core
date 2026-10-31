@@ -18,6 +18,7 @@
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
     "eval": "npm run build --silent && node dist/eval/run.js",
+    "worst-case": "npm run build --silent && node scripts/worst-case.mjs",
     "start": "node dist/cli.js"
   },
   "keywords": [
