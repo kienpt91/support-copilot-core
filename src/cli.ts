@@ -1,4 +1,4 @@
-import { JsonlAuditLog } from "./audit/chain.js";
+import { JsonlAuditLog, MemoryAuditLog } from "./audit/chain.js";
 import { OpenAiCompatibleGenerator } from "./assistant/generator.js";
 import { buildApp } from "./api/app.js";
 import { Core, type CoreOptions } from "./core.js";
@@ -10,8 +10,11 @@ import { OpenAiCompatibleEmbedder } from "./retrieval/embedder.js";
  *
  *   PORT, HOST              listen address (default 127.0.0.1:3000)
  *   OPERATOR_TOKEN          enables POST /v1/operator/tenants (omit to disable it)
- *   AUDIT_LOG_PATH          write the audit log to this JSONL file as well as keeping it in memory
- *   TRUST_PROXY=1           use X-Forwarded-For for client IPs (only behind a proxy you control)
+ *   AUDIT_LOG_PATH          write the audit log to this JSONL file as well as keeping it in memory; an existing file is
+ *                           verified on start and the process refuses to start if a chain is broken
+ *   AUDIT_HMAC_KEY          at least 32 characters; makes the audit chain an HMAC so editing the file is not enough to forge it
+ *   TRUSTED_PROXIES         X-Forwarded-For hops to believe: a number of proxies (e.g. 1) or comma-separated addresses/CIDRs.
+ *                           Leave unset unless a proxy you control overwrites or appends the header
  *   EMBEDDINGS_BASE_URL, EMBEDDINGS_MODEL, EMBEDDINGS_DIMENSIONS, EMBEDDINGS_API_KEY
  *                           use an OpenAI-compatible embeddings endpoint instead of the offline embedder
  *   LLM_BASE_URL, LLM_MODEL, LLM_API_KEY
@@ -19,6 +22,13 @@ import { OpenAiCompatibleEmbedder } from "./retrieval/embedder.js";
  *   --demo                  create a demo tenant with the fixture help-centre documents and print its keys
  *   DEMO_ORIGIN             origin allowed for the demo widget key (default http://localhost:8080)
  */
+/** A bare number means that many proxy hops; anything else is a comma-separated list of proxy addresses or CIDRs. */
+function parseTrustedProxies(value: string | undefined): number | string[] | undefined {
+  if (value === undefined) return undefined;
+  if (/^\d+$/.test(value)) return Number(value);
+  return value.split(",").map((s) => s.trim()).filter(Boolean);
+}
+
 function env(name: string): string | undefined {
   const v = process.env[name];
   return v !== undefined && v !== "" ? v : undefined;
@@ -27,7 +37,10 @@ function env(name: string): string | undefined {
 function buildCoreOptions(): CoreOptions {
   const opts: CoreOptions = {};
   const auditPath = env("AUDIT_LOG_PATH");
-  if (auditPath) opts.audit = new JsonlAuditLog(auditPath);
+  const hmacKey = env("AUDIT_HMAC_KEY");
+  if (hmacKey !== undefined && hmacKey.length < 32) throw new Error("AUDIT_HMAC_KEY must be at least 32 characters");
+  if (auditPath) opts.audit = new JsonlAuditLog(auditPath, { hmacKey });
+  else if (hmacKey) opts.audit = new MemoryAuditLog({ hmacKey });
 
   const embeddingsUrl = env("EMBEDDINGS_BASE_URL");
   if (embeddingsUrl) {
@@ -63,7 +76,7 @@ if (process.argv.includes("--demo")) await seedDemo(core);
 
 const app = buildApp(core, {
   operatorToken: env("OPERATOR_TOKEN"),
-  trustProxy: env("TRUST_PROXY") === "1",
+  trustProxy: parseTrustedProxies(env("TRUSTED_PROXIES")),
   logger: true,
 });
 const port = Number(env("PORT") ?? 3000);

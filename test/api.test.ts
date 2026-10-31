@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { FastifyInstance } from "fastify";
 import type { Core } from "../src/core.js";
 import { type ApiOptions, buildApp } from "../src/api/app.js";
-import { TokenBucketLimiter } from "../src/api/ratelimit.js";
+import { TokenBucketLimiter, clientKey } from "../src/api/ratelimit.js";
 import { EmbedderError, HashingEmbedder } from "../src/retrieval/embedder.js";
 import { CORPUS } from "../src/eval/corpus.js";
 import { FakeClock, newCore, settle } from "./helpers.js";
@@ -601,5 +601,121 @@ describe("management endpoints", () => {
     const auditB = body(await env.app.inject({ url: "/v1/audit", headers: bearer(b.ownerKey) })).entries as { tenantId: string; action: string }[];
     expect(auditB.every((e) => e.tenantId === b.tenant.id)).toBe(true);
     expect(auditB.map((e) => e.action)).not.toContain("settings.update");
+  });
+});
+
+describe("client addresses and chat abuse limits", () => {
+  const chatAs = (env: Env, key: string, remoteAddress: string, origin: string = ORIGIN, headers: Record<string, string> = {}) =>
+    env.app.inject({ method: "POST", url: `/v1/chat?pk=${key}`, remoteAddress, headers: { origin, ...headers }, payload: { message: "hello" } });
+
+  it("clientKey keeps IPv4, unwraps IPv4-mapped IPv6 and reduces IPv6 to its /64", () => {
+    expect(clientKey("203.0.113.9")).toBe("203.0.113.9");
+    expect(clientKey("::ffff:203.0.113.9")).toBe("203.0.113.9");
+    expect(clientKey("2001:db8:1:2:aaaa:bbbb:cccc:dddd")).toBe("2001:0db8:0001:0002::/64");
+    expect(clientKey("2001:DB8:1:2::1")).toBe("2001:0db8:0001:0002::/64");
+    expect(clientKey("2001:db8::1")).toBe("2001:0db8:0000:0000::/64");
+    expect(clientKey("fe80::1%eth0")).toBe("fe80:0000:0000:0000::/64");
+    expect(clientKey("64:ff9b::192.0.2.33")).toBe("0064:ff9b:0000:0000::/64");
+    expect(clientKey("not-an-ip:::")).toBe("not-an-ip:::");
+  });
+
+  it("one client address cannot use up the chat quota that every other visitor shares", async () => {
+    const env = await boot({ limits: { chatIpBurst: 2, chatIpPerMinute: 1, chatBurst: 50 } });
+    const t = await env.createTenant("A");
+    const attacker = "198.51.100.7";
+    expect([(await chatAs(env, t.publicKey, attacker)).statusCode, (await chatAs(env, t.publicKey, attacker)).statusCode, (await chatAs(env, t.publicKey, attacker)).statusCode]).toEqual([200, 200, 429]);
+    expect((await chatAs(env, t.publicKey, "198.51.100.8")).statusCode).toBe(200);
+  });
+
+  it("treats addresses inside one IPv6 /64 as the same client", async () => {
+    const env = await boot({ limits: { chatIpBurst: 1, chatIpPerMinute: 1, chatBurst: 50 } });
+    const t = await env.createTenant("A");
+    expect((await chatAs(env, t.publicKey, "2001:db8:1:2::1")).statusCode).toBe(200);
+    expect((await chatAs(env, t.publicKey, "2001:db8:1:2:ffff:ffff:ffff:ffff")).statusCode).toBe(429);
+    expect((await chatAs(env, t.publicKey, "2001:db8:1:3::1")).statusCode).toBe(200);
+  });
+
+  it("requests with a wrong Origin spend none of the chat quota", async () => {
+    const env = await boot({ limits: { chatIpBurst: 2, chatIpPerMinute: 1, chatBurst: 2, chatPerMinute: 1 } });
+    const t = await env.createTenant("A");
+    for (let i = 0; i < 10; i++) expect((await chatAs(env, t.publicKey, "198.51.100.7", "https://evil.example")).statusCode).toBe(403);
+    expect((await chatAs(env, t.publicKey, "198.51.100.7")).statusCode).toBe(200);
+  });
+
+  it("server-side secret keys are not subject to the per-address widget limit", async () => {
+    const env = await boot({ limits: { chatIpBurst: 1, chatIpPerMinute: 1 } });
+    const t = await env.createTenant("A");
+    const call = () => env.app.inject({ method: "POST", url: "/v1/chat", remoteAddress: "198.51.100.7", headers: bearer(t.ownerKey), payload: { message: "hello" } });
+    expect([(await call()).statusCode, (await call()).statusCode, (await call()).statusCode]).toEqual([200, 200, 200]);
+  });
+
+  it("ignores X-Forwarded-For unless proxies are trusted, so a client cannot choose its own rate-limit key", async () => {
+    const env = await boot({ limits: { ipBurst: 1, ipPerMinute: 1 } });
+    const hit = (xff: string) => env.app.inject({ url: "/healthz", remoteAddress: "198.51.100.7", headers: { "x-forwarded-for": xff } });
+    expect((await hit("1.1.1.1")).statusCode).toBe(200);
+    expect((await hit("2.2.2.2")).statusCode).toBe(429);
+  });
+
+  it("with one trusted proxy only the address that proxy appended counts; entries the client adds are ignored", async () => {
+    const env = await boot({ trustProxy: 1, limits: { ipBurst: 1, ipPerMinute: 1 } });
+    // The proxy (10.0.0.1) appended the real client address 203.0.113.50; the client prepended forged ones.
+    const hit = (forged: string, real: string) => env.app.inject({ url: "/healthz", remoteAddress: "10.0.0.1", headers: { "x-forwarded-for": `${forged}, ${real}` } });
+    expect((await hit("9.9.9.1", "203.0.113.50")).statusCode).toBe(200);
+    expect((await hit("9.9.9.2", "203.0.113.50")).statusCode).toBe(429);
+    expect((await hit("9.9.9.3", "203.0.113.51")).statusCode).toBe(200);
+  });
+
+  it("an address list works as an alternative to a hop count", async () => {
+    const env = await boot({ trustProxy: ["10.0.0.0/8"], limits: { ipBurst: 1, ipPerMinute: 1 } });
+    const hit = (real: string, peer: string) => env.app.inject({ url: "/healthz", remoteAddress: peer, headers: { "x-forwarded-for": real } });
+    expect((await hit("203.0.113.50", "10.1.2.3")).statusCode).toBe(200);
+    expect((await hit("203.0.113.50", "10.9.9.9")).statusCode).toBe(429);
+    // A peer outside the list is not a proxy: its header is not believed.
+    expect((await hit("203.0.113.60", "198.51.100.1")).statusCode).toBe(200);
+    expect((await hit("203.0.113.61", "198.51.100.1")).statusCode).toBe(429);
+  });
+});
+
+describe("audit head anchoring over HTTP", () => {
+  it("returns the chain head and verifies against a recorded head", async () => {
+    const env = await boot();
+    const t = await env.createTenant("A");
+    const head = body(await env.app.inject({ url: "/v1/audit/head", headers: bearer(t.ownerKey) })).head as { seq: number; hash: string };
+    expect(head.seq).toBeGreaterThanOrEqual(1);
+    expect(head.hash).toMatch(/^[0-9a-f]{64}$/);
+    await env.app.inject({ method: "PATCH", url: "/v1/settings", headers: bearer(t.ownerKey), payload: { retrievalK: 6 } });
+    const ok = body(await env.app.inject({ url: `/v1/audit/verify?headSeq=${head.seq}&headHash=${head.hash}`, headers: bearer(t.ownerKey) }));
+    expect(ok).toMatchObject({ ok: true, entries: head.seq + 1 });
+  });
+
+  it("reports a recorded head that does not match the log, or one beyond its end", async () => {
+    const env = await boot();
+    const t = await env.createTenant("A");
+    const head = body(await env.app.inject({ url: "/v1/audit/head", headers: bearer(t.ownerKey) })).head as { seq: number; hash: string };
+    const wrong = body(await env.app.inject({ url: `/v1/audit/verify?headSeq=${head.seq}&headHash=${"0".repeat(64)}`, headers: bearer(t.ownerKey) }));
+    expect(wrong).toMatchObject({ ok: false, reason: expect.stringContaining("does not match") });
+    const beyond = body(await env.app.inject({ url: `/v1/audit/verify?headSeq=${head.seq + 5}&headHash=${head.hash}`, headers: bearer(t.ownerKey) }));
+    expect(beyond).toMatchObject({ ok: false, reason: expect.stringContaining("truncated") });
+  });
+
+  it("validates the head parameters and requires the audit permission", async () => {
+    const env = await boot();
+    const t = await env.createTenant("A");
+    const agent = await env.issue(t, "agent");
+    const get = (q: string) => env.app.inject({ url: `/v1/audit/verify${q}`, headers: bearer(t.ownerKey) });
+    expect((await get("?headSeq=1")).statusCode).toBe(400);
+    expect((await get(`?headHash=${"a".repeat(64)}`)).statusCode).toBe(400);
+    expect((await get("?headSeq=1&headHash=nothex")).statusCode).toBe(400);
+    expect((await get("?headSeq=0&headHash=" + "a".repeat(64))).statusCode).toBe(400);
+    expect((await env.app.inject({ url: "/v1/audit/head", headers: bearer(agent) })).statusCode).toBe(403);
+  });
+
+  it("an empty tenant has no head", async () => {
+    const env = await boot();
+    const t = await env.createTenant("A");
+    // createTenant itself audits, so use a fresh core-level tenant to see the empty case.
+    const fresh = env.core.tenants.create({ name: "bare" });
+    expect(env.core.auditHead({ tenantId: fresh.id, keyId: "k", role: "admin" })).toBeNull();
+    expect(t.tenant.id).not.toBe(fresh.id);
   });
 });

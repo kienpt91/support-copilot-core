@@ -17,15 +17,19 @@ import type { PublicKeyInfo } from "../tenancy/keys.js";
 import type { TenantSettings } from "../tenancy/registry.js";
 import { type Actor, type Role, assertCan } from "../tenancy/roles.js";
 import { type Clock, isRecord, sha256Hex, systemClock } from "../util.js";
-import { TokenBucketLimiter } from "./ratelimit.js";
+import { TokenBucketLimiter, clientKey } from "./ratelimit.js";
 
 export interface ApiOptions {
   /** Enables `POST /v1/operator/tenants` when set. Without it that route does not exist. */
   operatorToken?: string;
   /** Largest accepted request body in bytes (document uploads). Chat requests have their own, much smaller, limit. */
   bodyLimitBytes?: number;
-  /** Honour X-Forwarded-For. Only enable behind a proxy you control, or clients can pick their own rate-limit key. */
-  trustProxy?: boolean;
+  /**
+   * Which X-Forwarded-For hops to believe: a number of trusted proxies in front of this server, or a list of
+   * proxy addresses/CIDRs. Unset means the socket address is used and the header is ignored. A bare "trust
+   * everything" is deliberately not offered: with it a client chooses its own rate-limit key.
+   */
+  trustProxy?: number | readonly string[];
   logger?: boolean;
   clock?: Clock;
   limits?: Partial<{
@@ -35,6 +39,8 @@ export interface ApiOptions {
     keyPerMinute: number;
     chatBurst: number;
     chatPerMinute: number;
+    chatIpBurst: number;
+    chatIpPerMinute: number;
     authFailureBurst: number;
     authFailurePerMinute: number;
   }>;
@@ -44,6 +50,14 @@ const CHAT_BODY_LIMIT = 16 * 1024;
 const ID = { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" } as const;
 const ID_PARAMS = { type: "object", properties: { id: ID }, required: ["id"] } as const;
 
+/** Fastify's typings accept a trust function but not a bare hop count, so a number is expressed as "trust the first N hops". */
+function trustedHops(trust: ApiOptions["trustProxy"]): boolean | string[] | ((address: string, hop: number) => boolean) {
+  if (typeof trust === "number") {
+    const hops = trust;
+    return (_address, hop) => hop < hops;
+  }
+  return trust ? [...trust] : false;
+}
 type IdRoute = { Params: { id: string } };
 type ChatRoute = { Body: { message: string; conversationId?: string } };
 type OperatorRoute = { Body: { name: string; allowedOrigins?: string[] } };
@@ -109,14 +123,17 @@ export function buildApp(core: Core, opts: ApiOptions = {}): FastifyInstance {
   const limits = opts.limits ?? {};
   const ipLimiter = new TokenBucketLimiter(limits.ipBurst ?? 60, limits.ipPerMinute ?? 120, clock);
   const keyLimiter = new TokenBucketLimiter(limits.keyBurst ?? 120, limits.keyPerMinute ?? 300, clock);
-  const chatLimiter = new TokenBucketLimiter(limits.chatBurst ?? 10, limits.chatPerMinute ?? 30, clock);
+  // Chat is limited twice for public (widget) keys: per client address first, so one client cannot drain the
+  // quota everyone else shares, then per key as an aggregate ceiling.
+  const chatLimiter = new TokenBucketLimiter(limits.chatBurst ?? 60, limits.chatPerMinute ?? 300, clock);
+  const chatIpLimiter = new TokenBucketLimiter(limits.chatIpBurst ?? 10, limits.chatIpPerMinute ?? 20, clock);
   const authFailures = new TokenBucketLimiter(limits.authFailureBurst ?? 10, limits.authFailurePerMinute ?? 10, clock);
   const operatorHash = opts.operatorToken ? Buffer.from(sha256Hex(opts.operatorToken), "hex") : null;
 
   const app = Fastify({
     logger: opts.logger ?? false,
     bodyLimit: opts.bodyLimitBytes ?? 1_500_000,
-    trustProxy: opts.trustProxy ?? false,
+    trustProxy: trustedHops(opts.trustProxy),
     ajv: { customOptions: { coerceTypes: false, removeAdditional: false, useDefaults: false, allErrors: false } },
   });
   // A text/plain body is a "simple" cross-origin request that browsers send without a preflight, so only JSON is accepted.
@@ -125,7 +142,7 @@ export function buildApp(core: Core, opts: ApiOptions = {}): FastifyInstance {
   // --- cross-cutting -------------------------------------------------------------------------
 
   app.addHook("onRequest", async (req) => {
-    const decision = ipLimiter.take(req.ip);
+    const decision = ipLimiter.take(clientKey(req.ip));
     if (!decision.ok) throw new RateLimitedError(decision.retryAfterSeconds);
   });
 
@@ -162,7 +179,7 @@ export function buildApp(core: Core, opts: ApiOptions = {}): FastifyInstance {
    * Valid credentials are never blocked by this, so one noisy client cannot lock out others behind the same address.
    */
   function failAuth(req: FastifyRequest): never {
-    const decision = authFailures.take(req.ip);
+    const decision = authFailures.take(clientKey(req.ip));
     if (!decision.ok) throw new RateLimitedError(decision.retryAfterSeconds);
     throw new UnauthorizedError("Missing or invalid API key.");
   }
@@ -218,7 +235,7 @@ export function buildApp(core: Core, opts: ApiOptions = {}): FastifyInstance {
     const record = widgetKeyFromQuery(req);
     const origin = req.headers.origin;
     if (!record || !originAllowed(record, origin)) {
-      if (!record) authFailures.take(req.ip);
+      if (!record) authFailures.take(clientKey(req.ip));
       return reply.code(403).send({ error: { code: "origin_not_allowed", message: "Origin is not allowed for this key." } });
     }
     corsHeaders(reply, origin);
@@ -243,24 +260,17 @@ export function buildApp(core: Core, opts: ApiOptions = {}): FastifyInstance {
     },
     async (req, reply) => {
       const presented = readCredential(req);
-      let principal: ChatPrincipal;
-      if (presented) {
-        const record = core.keys.authenticate(presented);
-        if (!record) return failAuth(req);
-        limitKey(record);
-        principal = { tenantId: record.tenantId, keyId: record.id, kind: record.kind === "secret" ? "api" : "widget" };
-        if (record.kind === "public") {
-          if (!originAllowed(record, req.headers.origin)) throw new ForbiddenError("Origin is not allowed for this key.");
-          corsHeaders(reply, req.headers.origin as string);
-        }
-      } else {
-        const record = widgetKeyFromQuery(req);
-        if (!record) return failAuth(req);
+      const record = presented ? core.keys.authenticate(presented) : widgetKeyFromQuery(req);
+      if (!record) return failAuth(req);
+      const principal: ChatPrincipal = { tenantId: record.tenantId, keyId: record.id, kind: record.kind === "secret" ? "api" : "widget" };
+      if (record.kind === "public") {
+        // The origin check comes first so requests with a wrong Origin cannot spend any quota.
         if (!originAllowed(record, req.headers.origin)) throw new ForbiddenError("Origin is not allowed for this key.");
         corsHeaders(reply, req.headers.origin as string);
-        limitKey(record);
-        principal = { tenantId: record.tenantId, keyId: record.id, kind: "widget" };
+        const perIp = chatIpLimiter.take(clientKey(req.ip));
+        if (!perIp.ok) throw new RateLimitedError(perIp.retryAfterSeconds);
       }
+      limitKey(record);
       const decision = chatLimiter.take(`${principal.tenantId}:${principal.keyId}`);
       if (!decision.ok) throw new RateLimitedError(decision.retryAfterSeconds);
       const { message, conversationId } = req.body;
@@ -411,7 +421,16 @@ export function buildApp(core: Core, opts: ApiOptions = {}): FastifyInstance {
     const actor = requireActor(req);
     return { entries: core.auditEntries(actor, { limit: queryInt(req, "limit", 1, 500) ?? 100, afterSeq: queryInt(req, "afterSeq", 0, 1_000_000_000) }) };
   });
-  app.get("/v1/audit/verify", async (req) => core.verifyAudit(requireActor(req)));
+  app.get("/v1/audit/head", async (req) => ({ head: core.auditHead(requireActor(req)) }));
+  // To detect truncation, record the head somewhere the log writer cannot reach and pass it back as headSeq and headHash.
+  app.get("/v1/audit/verify", async (req) => {
+    const actor = requireActor(req);
+    const headSeq = queryInt(req, "headSeq", 1, 1_000_000_000);
+    const headHash = queryString(req, "headHash");
+    if ((headSeq === undefined) !== (headHash === undefined)) throw new ValidationError("headSeq and headHash must be given together.");
+    if (headHash !== undefined && !/^[0-9a-f]{64}$/.test(headHash)) throw new ValidationError("headHash must be 64 lowercase hex characters.");
+    return core.verifyAudit(actor, headSeq !== undefined && headHash !== undefined ? { expectedHead: { seq: headSeq, hash: headHash } } : {});
+  });
 
   // --- keys and settings -----------------------------------------------------------------------
 
