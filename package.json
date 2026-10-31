@@ -1,0 +1,39 @@
+{
+  "name": "support-copilot-core",
+  "version": "0.1.0",
+  "description": "Backend core of a multi-tenant, document-grounded support assistant: tenancy, async ingestion, hybrid retrieval, cited answers, PII redaction, audit log, analytics and a small HTTP API.",
+  "license": "MIT",
+  "author": "Kien Phan",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=22.12"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json && node scripts/copy-assets.mjs",
+    "eval": "node dist/eval/run.js",
+    "start": "node dist/cli.js"
+  },
+  "keywords": [
+    "rag",
+    "multi-tenant",
+    "support",
+    "bm25",
+    "hybrid-search",
+    "fastify"
+  ],
+  "devDependencies": {
+    "@types/node": "22.20.5",
+    "typescript": "5.9.3",
+    "vitest": "5.0.5"
+  },
+  "dependencies": {
+    "fastify": "5.12.7"
+  }
+}
