@@ -6,6 +6,7 @@ import { type Chunk, type HybridRetriever } from "../retrieval/retriever.js";
 import { type Actor, assertCan } from "../tenancy/roles.js";
 import { ScopedCollection } from "../tenancy/scoped.js";
 import { type Clock, type IdGen, randomId, sha256Hex, systemClock } from "../util.js";
+import { ProcessingBudget } from "./budget.js";
 import { type ChunkOptions, chunkSections } from "./chunk.js";
 import { type DocFormat, detectFormat, normalizeContent, parseDocument } from "./parse.js";
 import type { Job, JobQueue } from "./queue.js";
@@ -26,11 +27,9 @@ export interface DocumentRecord {
   createdBy: string;
   createdAt: number;
   updatedAt: number;
-  /** Source text, kept so a failed job can be retried. Never returned by the API. */
-  raw: string;
 }
 
-export type DocumentView = Omit<DocumentRecord, "raw">;
+export type DocumentView = DocumentRecord;
 
 export interface DocumentStatusView {
   document: DocumentView;
@@ -50,15 +49,16 @@ export interface IngestDeps {
   clock?: Clock;
   newId?: IdGen;
   chunking?: ChunkOptions;
+  /** Active-CPU-time limit for parsing and chunking one document, in milliseconds. */
+  processingBudgetMs?: number;
 }
 
-function view(record: DocumentRecord): DocumentView {
-  const { raw: _raw, ...rest } = record;
-  return rest;
-}
+const sourceKey = (tenantId: string, documentId: string): string => `${tenantId}\u0000${documentId}`;
 
 export class IngestService {
   readonly documents = new ScopedCollection<DocumentRecord>("Document");
+  /** Source text by tenant and document id, kept out of `documents` so listing and cloning records stays cheap. */
+  private readonly sources = new Map<string, string>();
   private readonly clock: Clock;
   private readonly newId: IdGen;
 
@@ -104,7 +104,7 @@ export class IngestService {
         target: existing.id,
         details: { duplicate: true, title, bytes },
       });
-      return { document: view(existing), jobId: existing.jobId ?? "", duplicate: true };
+      return { document: existing, jobId: existing.jobId ?? "", duplicate: true };
     }
     if (!existing && this.documents.count(actor.tenantId) >= MAX_DOCUMENTS_PER_TENANT) {
       throw new ConflictError(`Document limit of ${MAX_DOCUMENTS_PER_TENANT} reached.`);
@@ -112,7 +112,7 @@ export class IngestService {
 
     const now = this.clock();
     const record: DocumentRecord = existing
-      ? { ...existing, title, status: "queued", error: null, updatedAt: now, raw: input.content }
+      ? { ...existing, title, status: "queued", error: null, updatedAt: now }
       : {
           id: this.newId("doc"),
           tenantId: actor.tenantId,
@@ -127,11 +127,11 @@ export class IngestService {
           createdBy: actor.keyId,
           createdAt: now,
           updatedAt: now,
-          raw: input.content,
         };
     const job = this.deps.queue.enqueue({ tenantId: actor.tenantId, type: INGEST_JOB, payload: { documentId: record.id } });
     record.jobId = job.id;
     this.documents.put(actor.tenantId, record);
+    this.sources.set(sourceKey(actor.tenantId, record.id), input.content);
     this.deps.audit.append({
       tenantId: actor.tenantId,
       actor: actor.keyId,
@@ -139,12 +139,12 @@ export class IngestService {
       target: record.id,
       details: { duplicate: false, retriedFailed: Boolean(existing), title, bytes, contentHash: contentHash.slice(0, 16), format },
     });
-    return { document: view(record), jobId: job.id, duplicate: false };
+    return { document: record, jobId: job.id, duplicate: false };
   }
 
   list(actor: Actor): DocumentView[] {
     assertCan(actor, "documents:read");
-    return this.documents.list(actor.tenantId).sort((a, b) => b.createdAt - a.createdAt).map(view);
+    return this.documents.list(actor.tenantId).sort((a, b) => b.createdAt - a.createdAt);
   }
 
   /** Document plus the state of its ingestion job: what the polled status endpoint returns. */
@@ -153,7 +153,7 @@ export class IngestService {
     const record = this.documents.require(actor.tenantId, documentId);
     const job = record.jobId ? this.deps.queue.get(actor.tenantId, record.jobId) : undefined;
     return {
-      document: view(record),
+      document: record,
       job: job
         ? { id: job.id, status: job.status, attempts: job.attempts, maxAttempts: job.maxAttempts, stage: job.stage, lastError: job.lastError, runAt: job.runAt, history: job.history }
         : null,
@@ -165,6 +165,7 @@ export class IngestService {
     const record = this.documents.require(actor.tenantId, documentId);
     const removedChunks = this.deps.retriever.removeDocument(actor.tenantId, documentId);
     this.documents.delete(actor.tenantId, documentId);
+    this.sources.delete(sourceKey(actor.tenantId, documentId));
     this.deps.audit.append({
       tenantId: actor.tenantId,
       actor: actor.keyId,
@@ -203,29 +204,37 @@ export class IngestService {
     const { tenantId } = job;
     const documentId = job.payload.documentId ?? "";
     const doc = this.documents.get(tenantId, documentId);
-    if (!doc) return; // deleted while queued: nothing to do
+    const raw = this.sources.get(sourceKey(tenantId, documentId));
+    if (!doc || raw === undefined) return; // deleted while queued: nothing to do
 
+    // Parsing and chunking run on the shared event loop; the budget makes them yield and caps their CPU time.
+    const budget = new ProcessingBudget(this.deps.processingBudgetMs);
     setStage("parse");
-    const parsed = parseDocument(doc.raw, doc.format);
+    const parsed = await parseDocument(raw, doc.format, budget);
 
     setStage("chunk");
-    const drafts = chunkSections(parsed.sections, this.deps.chunking);
+    const drafts = await chunkSections(parsed.sections, this.deps.chunking, budget);
 
     setStage("embed");
-    const chunks: Chunk[] = drafts.map((d, ordinal) => ({
-      id: `${documentId}:${ordinal}`,
-      tenantId,
-      documentId,
-      ordinal,
-      heading: redactStatic(chunkHeading(doc.title, d.heading)),
-      text: d.text,
-      indexText: redactStatic(d.text),
-    }));
+    const chunks: Chunk[] = [];
+    for (const [ordinal, d] of drafts.entries()) {
+      if (budget.due()) await budget.yield();
+      chunks.push({
+        id: `${documentId}:${ordinal}`,
+        tenantId,
+        documentId,
+        ordinal,
+        heading: redactStatic(chunkHeading(doc.title, d.heading)),
+        text: d.text,
+        indexText: redactStatic(d.text),
+      });
+    }
     const vectors: Float32Array[] = [];
     try {
       for (let i = 0; i < chunks.length; i += EMBED_BATCH) {
+        if (budget.due()) await budget.yield();
         const batch = chunks.slice(i, i + EMBED_BATCH);
-        vectors.push(...(await this.deps.embedder.embed(batch.map((c) => `${c.heading}\n${c.indexText}`))));
+        vectors.push(...(await budget.waitFor(this.deps.embedder.embed(batch.map((c) => `${c.heading}\n${c.indexText}`)))));
       }
     } catch (err) {
       if (err instanceof EmbedderError && !err.retryable) throw new PermanentJobError(err.message);

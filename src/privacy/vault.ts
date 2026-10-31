@@ -14,6 +14,17 @@ interface Entry {
 const NEVER_RESTORED: ReadonlySet<PiiKind> = new Set(["CARD", "NATIONAL_ID"]);
 
 /**
+ * Letters only, on purpose: a placeholder is re-scanned by the redaction wrappers in front of embedders and
+ * generators, and a random hex nonce would sometimes contain a run that passes the IBAN or card checksums and
+ * get mangled. Without digits in the nonce, no detector can match inside a placeholder.
+ */
+function randomNonce(): string {
+  let nonce = "";
+  for (const byte of randomBytes(24)) nonce += String.fromCharCode(97 + (byte % 26));
+  return nonce;
+}
+
+/**
  * Per-request store of reversible placeholders.
  *
  * Text sent to a generator is redacted with `[KIND_n:nonce]` placeholders. The nonce is random per
@@ -28,7 +39,8 @@ export class PiiVault {
 
   private readonly nonce: string;
 
-  constructor(nonce: string = randomBytes(4).toString("hex")) {
+  /** The default nonce is 24 random letters (about 113 bits) per request. Tests pass a fixed one. */
+  constructor(nonce: string = randomNonce()) {
     this.nonce = nonce.replace(/[^A-Za-z0-9]/g, "");
   }
 

@@ -212,3 +212,58 @@ describe("PiiVault", () => {
     expect(vault.restore(`Sent to ${text}.`, "none")).toBe("Sent to [EMAIL].");
   });
 });
+
+describe("separators and padding tricks", () => {
+  it.each(["/", "_", "- ", ". "])("finds a card number separated by %j", (sep) => {
+    expect(kinds(`pay ${VISA.join(sep)} now`)).toEqual(["CARD"]);
+  });
+
+  it("finds a card number padded with combining marks between the digits", () => {
+    const padded = VISA.join("").split("").join("\u0301");
+    const text = `pay ${padded} now`;
+    expect(kinds(text)).toEqual(["CARD"]);
+    expect(redactStatic(text)).toBe("pay [CARD] now");
+  });
+
+  it("still treats accented words as words, not as PII", () => {
+    expect(kinds("caf\u00e9 cr\u00e8me \u0111\u01b0\u1eddng")).toEqual([]);
+  });
+
+  it("does not turn digit lists with other separators into cards", () => {
+    expect(kinds("1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14")).toEqual([]);
+    expect(kinds("2026-10-31 02:12:45")).toEqual([]);
+  });
+});
+
+describe("overlap resolution", () => {
+  it("prefers the higher-priority kind when candidates overlap and leaves neighbours alone", () => {
+    const text = `a ${card(...VISA)} b 123-45-6789 c +1 415 555 2671 d ${card(...MC)} e`;
+    expect(kinds(text)).toEqual(["CARD", "NATIONAL_ID", "PHONE", "CARD"]);
+  });
+
+  it("gives the same spans for a long input as for its pieces", () => {
+    const piece = `mail jane@example.com or call +1 415 555 2671 re ${card(...VISA)}. `;
+    const single = findPii(piece).map((m) => [m.kind, m.value]);
+    const repeated = findPii(piece.repeat(200));
+    expect(repeated).toHaveLength(single.length * 200);
+    expect(repeated.slice(0, single.length).map((m) => [m.kind, m.value])).toEqual(single);
+  });
+});
+
+describe("vault nonce", () => {
+  it("is 24 random letters (about 113 bits) by default and differs between vaults", () => {
+    const a = new PiiVault().redact("jane@example.com", "user");
+    const b = new PiiVault().redact("jane@example.com", "user");
+    expect(a).toMatch(/^\[EMAIL_1:[a-z]{24}\]$/);
+    expect(b).toMatch(/^\[EMAIL_1:[a-z]{24}\]$/);
+    expect(a).not.toBe(b);
+  });
+
+  it("never contains anything the detectors would re-redact, however many vaults are drawn", () => {
+    const text = `jane@example.com +1 415 555 2671 ${card(...VISA)} DE89 3704 0044 0532 0130 00 123-45-6789`;
+    for (let i = 0; i < 3000; i++) {
+      const redacted = new PiiVault().redact(text, "user");
+      expect(redactStatic(redacted)).toBe(redacted);
+    }
+  });
+});

@@ -507,7 +507,7 @@ describe("chat endpoint, widget keys and CORS", () => {
     const res = await chat(env, t.publicKey, { origin: ORIGIN }, { message: `my card ${card} was declined, will I lose access? email jane@example.com` });
     expect(res.statusCode).toBe(200);
     expect(res.body).not.toContain("4111");
-    expect(res.body).not.toMatch(/\[[A-Z_]+_\d+:[0-9a-f]{8}\]/);
+    expect(res.body).not.toMatch(/\[[A-Z_]+_\d+:[a-z]{24}\]/);
   });
 });
 

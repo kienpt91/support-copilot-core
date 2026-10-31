@@ -17,7 +17,9 @@ export interface PiiMatch {
   value: string;
 }
 
-const INVISIBLE = /[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]/u;
+// Zero-width and formatting characters, and standalone combining marks, are dropped for detection so
+// that "4\u200B1\u03011" style padding cannot split a number.
+const INVISIBLE = /[\u00AD\u034F\u061C\u180E\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF\p{M}]/u;
 const DASHES = /[\u2010-\u2015\u2212\uFE58\uFE63\uFF0D]/u;
 const IS_DIGIT = /\p{Nd}/u;
 
@@ -105,7 +107,8 @@ const EMAIL_RE = new RegExp(
   "giu",
 );
 
-const CARD_RE = /(?<![\p{N}])(?:\d[ .\-]{0,2}){12,18}\d(?![\p{N}])/gu;
+// Card digits may be separated by up to two of space, dot, dash, slash or underscore; the Luhn check keeps false positives down.
+const CARD_RE = /(?<![\p{N}])(?:\d[ .\-/_]{0,2}){12,18}\d(?![\p{N}])/gu;
 const IBAN_RE = /(?<![\p{L}\p{N}])[A-Za-z]{2}\d{2}(?:[ \-]?[A-Za-z0-9]){11,30}(?![\p{L}\p{N}])/gu;
 const SSN_RE = /(?<![\d-])(?!000|666|9\d\d)\d{3}([ .-])(?!00)\d{2}\1(?!0000)\d{4}(?![\d-])/g;
 const ID_KEYWORD_RE =
@@ -121,7 +124,8 @@ function digitsOf(s: string): string {
 function plausiblePhone(raw: string): boolean {
   const digits = digitsOf(raw);
   if (digits.length < 7 || digits.length > 15) return false;
-  if (/^\d{4}-\d{1,2}-\d{1,2}$/.test(raw) || /^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$/.test(raw)) return false; // dates
+  // Dates, including an ISO date followed by a time ("2026-10-31 02:12"), which would otherwise look like 10+ digits.
+  if (/^\d{4}-\d{1,2}-\d{1,2}(?:\D|$)/.test(raw) || /^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}$/.test(raw)) return false;
   if (/^\d{1,3}(\.\d{1,3}){3}$/.test(raw)) return false; // IPv4
   if (/^\d+\.\d+(\.\d+)*$/.test(raw) && digits.length < 10) return false; // versions, decimals
   if (raw.startsWith("+")) return digits.length >= 8;
@@ -183,9 +187,23 @@ export function findPii(text: string): PiiMatch[] {
   if (text.length === 0) return [];
   const norm = normalize(text);
   const candidates = collect(norm).sort((a, b) => a.priority - b.priority || a.start - b.start);
+  if (candidates.length === 0) return [];
+  // Candidates are taken in priority order; a mask over the normalised text makes the overlap test
+  // proportional to the candidate's own length (the earlier pairwise scan was quadratic in the candidate count).
+  const occupied = new Uint8Array(norm.text.length);
   const accepted: Candidate[] = [];
   for (const c of candidates) {
-    if (!accepted.some((a) => c.start < a.end && a.start < c.end)) accepted.push(c);
+    let free = true;
+    for (let k = c.start; k < c.end; k++) {
+      if (occupied[k]) {
+        free = false;
+        break;
+      }
+    }
+    if (free) {
+      occupied.fill(1, c.start, c.end);
+      accepted.push(c);
+    }
   }
   accepted.sort((a, b) => a.start - b.start);
   return accepted.map((c) => {

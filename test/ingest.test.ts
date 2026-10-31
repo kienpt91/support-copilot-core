@@ -1,113 +1,259 @@
 import { describe, expect, it } from "vitest";
 import { PermanentJobError } from "../src/errors.js";
+import { ProcessingBudget } from "../src/ingest/budget.js";
 import { chunkSections } from "../src/ingest/chunk.js";
-import { decodeEntities, detectFormat, htmlToText, parseDocument } from "../src/ingest/parse.js";
+import { MAX_LINE_CHARS, decodeEntities, detectFormat, htmlToText, parseDocument } from "../src/ingest/parse.js";
 import { InMemoryJobQueue, type JobEvent, exponentialBackoff } from "../src/ingest/queue.js";
 import { IngestService } from "../src/ingest/service.js";
 import { EmbedderError, HashingEmbedder } from "../src/retrieval/embedder.js";
 import { FakeClock, actorFor, ingestHarness, settle } from "./helpers.js";
 
 describe("HTML to text", () => {
-  it("drops script, style, comments and event-handler attributes, keeping visible text", () => {
+  it("drops script, style, comments and event-handler attributes, keeping visible text", async () => {
     const html = `<html><head><title>x</title><style>p{color:red}</style></head><body onload="evil()">
       <!-- hidden --><h1>Refunds</h1><p onclick="steal()">You can <a href="javascript:alert(1)">request a refund</a> within 30 days.</p>
       <script>document.cookie</script></body></html>`;
-    const text = htmlToText(html);
+    const text = await htmlToText(html);
     expect(text).toContain("# Refunds");
     expect(text).toContain("You can request a refund within 30 days.");
     expect(text).not.toMatch(/evil|steal|javascript|cookie|color:red|hidden|<|>/);
   });
 
-  it("does not let split-tag evasions produce a tag", () => {
+  it("does not let split-tag evasions produce a tag", async () => {
     for (const evil of ["<scr<script>ipt>alert(1)</scr</script>ipt>", "<<script>script>alert(1)<</script>/script>", "<img src=x onerror=alert(1)//", "<svg><script>alert(1)</script></svg>after"]) {
-      const text = htmlToText(`<p>safe</p>${evil}`);
+      const text = await htmlToText(`<p>safe</p>${evil}`);
       expect(text, evil).not.toMatch(/<\/?[a-z!?]/i);
       expect(text, evil).not.toContain("onerror");
     }
-    expect(htmlToText("<script>alert(1)")).toBe("");
+    expect(await htmlToText("<script>alert(1)")).toBe("");
   });
 
-  it("decodes entities once, so an escaped tag stays literal text", () => {
-    expect(htmlToText("<p>1 &lt; 2 &amp;&amp; 3 &gt; 2</p>").trim()).toBe("1 < 2 && 3 > 2");
+  it("decodes entities once, so an escaped tag stays literal text", async () => {
+    expect((await htmlToText("<p>1 &lt; 2 &amp;&amp; 3 &gt; 2</p>")).trim()).toBe("1 < 2 && 3 > 2");
     expect(decodeEntities("&amp;lt;")).toBe("&lt;");
     expect(decodeEntities("&#65;&#x42;&bogus;&#0;&#1114112;")).toBe("AB&bogus;  ");
   });
 
-  it("keeps lists, headings and a lone '<' in text", () => {
-    const text = htmlToText("<h2>Steps</h2><ul><li>one</li><li>two</li></ul><p>a < b</p>");
+  it("looks entity names up in a map, so inherited object properties stay literal", () => {
+    for (const name of ["toString", "valueOf", "constructor", "hasOwnProperty"]) {
+      expect(decodeEntities(`&${name};`), name).toBe(`&${name};`);
+    }
+    expect(decodeEntities("&amp; &nbsp;|")).toBe("&  |");
+  });
+
+  it("keeps lists, headings and a lone '<' in text", async () => {
+    const text = await htmlToText("<h2>Steps</h2><ul><li>one</li><li>two</li></ul><p>a < b</p>");
     expect(text).toContain("## Steps");
     expect(text).toContain("- one");
     expect(text).toContain("- two");
     expect(text).toContain("a < b");
   });
 
-  it("handles unterminated tags and quoted '>' inside attributes", () => {
-    expect(htmlToText('<a title="a > b">link</a> after <div class="x')).toContain("link after");
-    expect(htmlToText('<a title="a > b">link</a>')).toBe("link");
+  it("handles unterminated tags and quoted '>' inside attributes", async () => {
+    expect(await htmlToText('<a title="a > b">link</a> after <div class="x')).toContain("link after");
+    expect(await htmlToText('<a title="a > b">link</a>')).toBe("link");
+  });
+
+  it("finds closing tags case-insensitively and skips content up to the matching one only", async () => {
+    expect(await htmlToText("<p>a</p><SCRIPT>bad()</ScRiPt >b<style>x{}</style>c")).toBe("\n\na\n\nbc");
+    expect(await htmlToText("<script>one</script>keep<script>two</script>")).toBe("keep");
   });
 });
 
 describe("document parsing", () => {
   it("detects formats", () => {
     expect(detectFormat("<html><body><p>hi</p></body></html>")).toBe("html");
+    expect(detectFormat("<!DOCTYPE html><title>x</title>")).toBe("html");
+    expect(detectFormat("<div>one</div> <p>two</p>")).toBe("html");
     expect(detectFormat("# Title\n\nbody")).toBe("markdown");
+    expect(detectFormat("intro\n\n- item one\n- item two")).toBe("markdown");
+    expect(detectFormat("1. first\n2. second")).toBe("markdown");
+    expect(detectFormat("```\ncode\n```")).toBe("markdown");
     expect(detectFormat("just some plain words")).toBe("text");
+    expect(detectFormat("use the <br> tag sparingly")).toBe("text");
+    expect(detectFormat("a #hashtag and 3 * 4 = 12")).toBe("text");
   });
 
-  it("builds heading paths from nested markdown headings and strips inline syntax", () => {
+  it("only looks at the start of a large document when guessing the format", () => {
+    expect(detectFormat(`${"plain words ".repeat(5000)}\n# heading far away`)).toBe("text");
+  });
+
+  it("builds heading paths from nested markdown headings and strips inline syntax", async () => {
     const md = "# Billing\nIntro **text** with a [link](https://x.example).\n\n## Refunds\nSee `refund` rules.\n\n### Cards\nCard refunds take 5 days.\n\n## Invoices\nDownload from the *dashboard*.";
-    const parsed = parseDocument(md, "markdown");
+    const parsed = await parseDocument(md, "markdown");
     expect(parsed.title).toBe("Billing");
     expect(parsed.sections.map((s) => s.heading)).toEqual(["Billing", "Billing > Refunds", "Billing > Refunds > Cards", "Billing > Invoices"]);
     expect(parsed.sections[0]!.text).toBe("Intro text with a link.");
     expect(parsed.sections[3]!.text).toBe("Download from the dashboard.");
   });
 
-  it("keeps fenced code, including lines that start with #", () => {
-    const parsed = parseDocument("# Doc\n```sh\n# not a heading\nnpm install\n```\n", "markdown");
+  it.each([
+    ["![alt text](https://x.example/a.png) after", "alt text after"],
+    ["[ref link][1] and [other][]", "ref link and other"],
+    ["**bold** and __also bold__ and ~~gone~~", "bold and also bold and gone"],
+    ["a * b * c and 2*3*4", "a * b * c and 2*3*4"],
+    ["*lead* and trail*", "lead and trail*"],
+    ["a `code` b `more` c", "a code b more c"],
+    ["[unclosed(link) and ] stray", "[unclosed(link) and ] stray"],
+    ["| a | b |", "a | b"],
+    ["> quoted text", "quoted text"],
+  ])("renders inline markdown %j as %j", async (input, expected) => {
+    const parsed = await parseDocument(`# T\n${input}`, "markdown");
+    expect(parsed.sections[0]!.text).toBe(expected);
+  });
+
+  it("drops thematic breaks and table separator rows", async () => {
+    const parsed = await parseDocument("# T\n---\n| h1 | h2 |\n|:--|--:|\n| a | b |\n***\nend", "markdown");
+    expect(parsed.sections[0]!.text).toBe("h1 | h2\na | b\nend");
+  });
+
+  it("parses headings with closing hashes, trailing '#' and levels up to 6, and rejects 7", async () => {
+    const parsed = await parseDocument("# One ##\nbody\n###### Six\n####### not a heading\ntext", "markdown");
+    expect(parsed.sections.map((s) => s.heading)).toEqual(["One", "One > Six"]);
+    expect(parsed.sections[1]!.text).toBe("####### not a heading\ntext");
+  });
+
+  it("keeps fenced code, including lines that start with #", async () => {
+    const parsed = await parseDocument("# Doc\n```sh\n# not a heading\nnpm install\n```\n", "markdown");
     expect(parsed.sections).toHaveLength(1);
     expect(parsed.sections[0]!.text).toContain("# not a heading");
   });
 
-  it("strips inline HTML from markdown, including split-tag evasions", () => {
-    const parsed = parseDocument("# T\nHello <b>world</b> <scr<script>ipt>alert(1)</script> <!-- c --> done", "markdown");
+  it("strips inline HTML from markdown, including split-tag evasions", async () => {
+    const parsed = await parseDocument("# T\nHello <b>world</b> <scr<script>ipt>alert(1)</script> <!-- c --> done", "markdown");
     expect(parsed.sections[0]!.text).not.toMatch(/<\/?(?:b|script)|alert|<!--/i);
     expect(parsed.sections[0]!.text).toContain("Hello world");
   });
 
-  it("treats plain text as one section and normalises control characters and CRLF", () => {
-    const parsed = parseDocument("line one\r\nline\u0000 two\u0007", "text");
+  it("treats plain text as one section and normalises control characters and CRLF", async () => {
+    const parsed = await parseDocument("line one\r\nline\u0000 two\u0007", "text");
     expect(parsed.sections).toEqual([{ heading: "", text: "line one\nline two" }]);
   });
 
-  it("rejects content with no extractable text as a permanent failure", () => {
-    expect(() => parseDocument("   \n\n  ", "text")).toThrow(PermanentJobError);
-    expect(() => parseDocument("<script>x()</script>", "html")).toThrow(PermanentJobError);
-    expect(() => parseDocument("# \n---\n", "markdown")).toThrow(PermanentJobError);
+  it("wraps lines longer than the per-line cap instead of processing them whole", async () => {
+    const parsed = await parseDocument(`# T\n${"word ".repeat(5000)}`, "markdown");
+    expect(parsed.sections[0]!.text.split("\n").every((l) => l.length <= MAX_LINE_CHARS)).toBe(true);
+    expect(parsed.sections[0]!.text.replace(/\s+/g, " ").trim()).toBe("word ".repeat(5000).trim());
+  });
+
+  it("rejects content with no extractable text as a permanent failure", async () => {
+    await expect(parseDocument("   \n\n  ", "text")).rejects.toThrow(PermanentJobError);
+    await expect(parseDocument("<script>x()</script>", "html")).rejects.toThrow(PermanentJobError);
+    await expect(parseDocument("# \n---\n", "markdown")).rejects.toThrow(PermanentJobError);
+  });
+});
+
+describe("processing budget", () => {
+  it("yields to the event loop during a long parse, so other work runs in between", async () => {
+    const budget = new ProcessingBudget(60_000, 0);
+    let ticks = 0;
+    const interval = setInterval(() => ticks++, 0);
+    const text = Array.from({ length: 30_000 }, (_, i) => `line ${i} with **bold** and [a](b)`).join("\n");
+    await parseDocument(`# T\n${text}`, "markdown", budget);
+    clearInterval(interval);
+    expect(ticks).toBeGreaterThan(0);
+  });
+
+  it("rejects a document permanently once it has used its CPU budget", async () => {
+    const budget = new ProcessingBudget(0, 0);
+    const text = Array.from({ length: 2000 }, (_, i) => `line ${i}`).join("\n");
+    await expect(parseDocument(`# T\n${text}`, "markdown", budget)).rejects.toThrow(/CPU time/);
+    await expect(parseDocument(`# T\n${text}`, "markdown", budget)).rejects.toBeInstanceOf(PermanentJobError);
+  });
+
+  it("does not count time spent waiting for other work against the document", async () => {
+    let t = 0;
+    const budget = new ProcessingBudget(100, 10, () => t);
+    t = 40; // 40 ms of computing
+    await budget.waitFor(
+      Promise.resolve().then(() => {
+        t += 10_000; // a slow network call: time passes while waiting
+      }),
+    );
+    expect(budget.activeTimeMs).toBe(40);
+    expect(budget.due()).toBe(false);
+    t += 30; // 30 more ms of computing: 70 in total, still within 100
+    await expect(budget.yield()).resolves.toBeUndefined();
+    expect(budget.activeTimeMs).toBe(70);
+  });
+
+  it("charges computing time but not waiting time when the limit is crossed", async () => {
+    let t = 0;
+    const budget = new ProcessingBudget(100, 10, () => t);
+    t = 101;
+    await expect(budget.yield()).rejects.toThrow(/more than 100 ms of CPU time/);
+    const waiting = new ProcessingBudget(100, 10, () => t);
+    t += 99;
+    await waiting.waitFor(
+      Promise.resolve().then(() => {
+        t += 1_000_000;
+      }),
+    );
+    await expect(waiting.yield()).resolves.toBeUndefined();
+  });
+
+  it("reports when a slice has run long enough to yield", () => {
+    let t = 0;
+    const budget = new ProcessingBudget(1000, 10, () => t);
+    expect(budget.due()).toBe(false);
+    t = 9;
+    expect(budget.due()).toBe(false);
+    t = 10;
+    expect(budget.due()).toBe(true);
   });
 });
 
 describe("chunking", () => {
-  it("never mixes sections and respects the size budget", () => {
+  it("never mixes sections and respects the size budget", async () => {
     const long = Array.from({ length: 30 }, (_, i) => `Sentence number ${i} says something useful.`).join(" ");
-    const chunks = chunkSections([{ heading: "A", text: long }, { heading: "B", text: "short one" }], { maxChars: 200 });
+    const chunks = await chunkSections([{ heading: "A", text: long }, { heading: "B", text: "short one" }], { maxChars: 200 });
     expect(chunks.filter((c) => c.heading === "A").length).toBeGreaterThan(3);
     expect(chunks.every((c) => c.text.length <= 200)).toBe(true);
     expect(chunks.at(-1)).toEqual({ heading: "B", text: "short one" });
   });
 
-  it("packs short paragraphs together and splits an over-long word run at word boundaries", () => {
-    expect(chunkSections([{ heading: "", text: "one\n\ntwo\n\nthree" }], { maxChars: 100 })).toEqual([{ heading: "", text: "one\ntwo\nthree" }]);
+  it("prefers to end a chunk at a sentence boundary", async () => {
+    const long = Array.from({ length: 12 }, (_, i) => `Sentence number ${i} says something.`).join(" ");
+    const chunks = await chunkSections([{ heading: "", text: long }], { maxChars: 120 });
+    expect(chunks.slice(0, -1).every((c) => c.text.endsWith("."))).toBe(true);
+  });
+
+  it("packs short paragraphs together and splits an over-long word run at word boundaries", async () => {
+    expect(await chunkSections([{ heading: "", text: "one\n\ntwo\n\nthree" }], { maxChars: 100 })).toEqual([{ heading: "", text: "one\ntwo\nthree" }]);
     const words = Array.from({ length: 100 }, () => "word").join(" ");
-    const chunks = chunkSections([{ heading: "", text: words }], { maxChars: 50 });
+    const chunks = await chunkSections([{ heading: "", text: words }], { maxChars: 50 });
     expect(chunks.length).toBeGreaterThan(5);
     expect(chunks.every((c) => c.text.length <= 50)).toBe(true);
     expect(chunks.map((c) => c.text).join(" ")).toBe(words);
   });
 
-  it("refuses documents that would explode into too many chunks", () => {
+  it("hard-splits a single token with no whitespace, so no chunk can exceed the limit", async () => {
+    const chunks = await chunkSections([{ heading: "", text: "x".repeat(1900) }], { maxChars: 600 });
+    expect(chunks.map((c) => c.text.length)).toEqual([600, 600, 600, 100]);
+  });
+
+  it("never cuts through a card number, IBAN, phone number or email at a chunk boundary", async () => {
+    const pii = ["4111 1111 1111 1111", "DE89 3704 0044 0532 0130 00", "+84 912 345 678", "jane.doe [at] example [dot] com"];
+    for (const secret of pii) {
+      for (let pad = 40; pad <= 52; pad++) {
+        const text = `${"a".repeat(pad)} ${secret} ${"b".repeat(60)}`;
+        const chunks = await chunkSections([{ heading: "", text }], { maxChars: 64 });
+        expect(chunks.some((c) => c.text.includes(secret)), `${secret} at offset ${pad}`).toBe(true);
+      }
+    }
+  });
+
+  it("keeps PII intact when sentence-like punctuation sits inside it", async () => {
+    const card = "4111. 1111. 1111. 1111";
+    const text = `${"filler ".repeat(8)}${card} ${"tail ".repeat(10)}`;
+    const chunks = await chunkSections([{ heading: "", text }], { maxChars: 60 });
+    expect(chunks.some((c) => c.text.includes(card))).toBe(true);
+  });
+
+  it("refuses documents that would explode into too many chunks", async () => {
     const text = Array.from({ length: 50 }, (_, i) => `paragraph ${i}`).join("\n\n");
-    expect(() => chunkSections([{ heading: "", text }], { maxChars: 12, maxChunks: 10 })).toThrow(PermanentJobError);
+    await expect(chunkSections([{ heading: "", text }], { maxChars: 12, maxChunks: 10 })).rejects.toThrow(PermanentJobError);
+    await expect(chunkSections([{ heading: "", text: "x".repeat(10_000) }], { maxChars: 10, maxChunks: 50 })).rejects.toThrow(/more than 50 chunks/);
   });
 });
 

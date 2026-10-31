@@ -289,7 +289,7 @@ describe("privacy in the answering path", () => {
     await chat(`My email is jane@example.com and my card ${card}, how do I get a refund? Call +1 415 555 2671 or DE89 3704 0044 0532 0130 00`);
     const everything = JSON.stringify([embedded, spy.inputs]);
     expect(everything).not.toMatch(/jane@example|4111|555 2671|DE89 3704/);
-    expect(spy.inputs[0]!.question).toMatch(/\[EMAIL_1:[0-9a-f]{8}\]/);
+    expect(spy.inputs[0]!.question).toMatch(/\[EMAIL_1:[a-z]{24}\]/);
     expect(embedded.length).toBeGreaterThan(0);
   });
 
@@ -299,7 +299,7 @@ describe("privacy in the answering path", () => {
     await chat("How do I contact support by email?");
     const sent = JSON.stringify(spy.inputs);
     expect(sent).not.toContain("help@ledgerly.example");
-    expect(sent).toMatch(/\[EMAIL_\d+:[0-9a-f]{8}\]/);
+    expect(sent).toMatch(/\[EMAIL_\d+:[a-z]{24}\]/);
   });
 
   it("does not store the customer's raw PII in the conversation record", async () => {
@@ -314,8 +314,8 @@ describe("privacy in the answering path", () => {
   const echo: Generator = {
     id: "echo",
     async generate({ question }) {
-      const email = /\[EMAIL_\d+:[0-9a-f]+\]/.exec(question)?.[0] ?? "you";
-      const cardTag = /\[CARD_\d+:[0-9a-f]+\]/.exec(question)?.[0] ?? "card";
+      const email = /\[EMAIL_\d+:[a-z]+\]/.exec(question)?.[0] ?? "you";
+      const cardTag = /\[CARD_\d+:[a-z]+\]/.exec(question)?.[0] ?? "card";
       return `We will write to ${email} about ${cardTag}. [1]`;
     },
   };
@@ -331,14 +331,14 @@ describe("privacy in the answering path", () => {
     const { chat } = await setup({ generator: echo }, { piiRestore: "none" });
     const res = await chat(message);
     expect(res.answer).toBe("We will write to [EMAIL] about [CARD]. [1]");
-    expect(res.answer).not.toMatch(/:[0-9a-f]{8}\]/);
+    expect(res.answer).not.toMatch(/:[a-z]{24}\]/);
   });
 
   it("restores a document's email only under policy 'all'", async () => {
     const docEcho: Generator = {
       id: "doc-echo",
       async generate({ evidence }) {
-        const tag = evidence.map((e) => /\[EMAIL_\d+:[0-9a-f]+\]/.exec(e.text)?.[0]).find(Boolean);
+        const tag = evidence.map((e) => /\[EMAIL_\d+:[a-z]+\]/.exec(e.text)?.[0]).find(Boolean);
         return `Write to ${tag ?? "support"}. [1]`;
       },
     };

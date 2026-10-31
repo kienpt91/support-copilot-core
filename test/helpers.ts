@@ -17,13 +17,13 @@ export class FakeClock {
 
 export const actorFor = (tenantId: string, role: Actor["role"] = "admin", keyId = `key-${tenantId}-${role}`): Actor => ({ tenantId, role, keyId });
 
-export function ingestHarness(opts: { embedder?: Embedder; queue?: InMemoryQueueOptions } = {}) {
+export function ingestHarness(opts: { embedder?: Embedder; queue?: InMemoryQueueOptions; processingBudgetMs?: number } = {}) {
   const clock = new FakeClock();
   const queue = new InMemoryJobQueue({ clock: clock.read, backoffMs: (n) => 1000 * n, ...opts.queue });
   const embedder = new RedactingEmbedder(opts.embedder ?? new HashingEmbedder(256));
   const retriever = new HybridRetriever(embedder);
   const audit = new MemoryAuditLog(clock.read);
-  const service = new IngestService({ queue, retriever, embedder, audit, clock: clock.read });
+  const service = new IngestService({ queue, retriever, embedder, audit, clock: clock.read, processingBudgetMs: opts.processingBudgetMs });
   return { clock, queue, retriever, embedder, audit, service };
 }
 
