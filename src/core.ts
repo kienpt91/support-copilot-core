@@ -1,4 +1,4 @@
-import { type AuditLog, MemoryAuditLog } from "./audit/chain.js";
+import { type AuditLog, type ChainHead, MemoryAuditLog } from "./audit/chain.js";
 import { AnalyticsService } from "./analytics.js";
 import { ChatService } from "./assistant/chat.js";
 import { ExtractiveGenerator, type Generator, RedactingGenerator } from "./assistant/generator.js";
@@ -44,7 +44,7 @@ export class Core {
   constructor(opts: CoreOptions = {}) {
     const clock = opts.clock ?? systemClock;
     const newId = opts.newId ?? randomId;
-    this.audit = opts.audit ?? new MemoryAuditLog(clock);
+    this.audit = opts.audit ?? new MemoryAuditLog({ clock });
     this.tenants = new TenantRegistry(clock, newId);
     this.keys = new ApiKeyService(clock);
     this.queue = opts.queue ?? new InMemoryJobQueue({ clock, newId, ...opts.queueOptions });
@@ -131,9 +131,15 @@ export class Core {
     return this.audit.list(actor.tenantId, opts);
   }
 
-  verifyAudit(actor: Actor) {
+  verifyAudit(actor: Actor, opts: { expectedHead?: ChainHead } = {}) {
     assertCan(actor, "audit:read");
-    return this.audit.verify(actor.tenantId);
+    return this.audit.verify(actor.tenantId, opts);
+  }
+
+  /** The newest entry's sequence number and hash for the caller's tenant: store it elsewhere to detect truncation later. */
+  auditHead(actor: Actor): ChainHead | null {
+    assertCan(actor, "audit:read");
+    return this.audit.head(actor.tenantId);
   }
 
   /** Starts background job processing (for the HTTP server). Tests call `queue.tick()` instead. */

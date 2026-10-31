@@ -22,7 +22,7 @@ export function ingestHarness(opts: { embedder?: Embedder; queue?: InMemoryQueue
   const queue = new InMemoryJobQueue({ clock: clock.read, backoffMs: (n) => 1000 * n, ...opts.queue });
   const embedder = new RedactingEmbedder(opts.embedder ?? new HashingEmbedder(256));
   const retriever = new HybridRetriever(embedder);
-  const audit = new MemoryAuditLog(clock.read);
+  const audit = new MemoryAuditLog({ clock: clock.read });
   const service = new IngestService({ queue, retriever, embedder, audit, clock: clock.read, processingBudgetMs: opts.processingBudgetMs });
   return { clock, queue, retriever, embedder, audit, service };
 }

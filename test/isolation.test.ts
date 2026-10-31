@@ -150,6 +150,7 @@ describe("isolation coverage guard", () => {
     expect(publicMethods(HybridRetriever)).toEqual(["chunkCount", "commit", "index", "removeDocument", "search"]);
     expect(publicMethods(Core)).toEqual([
       "auditEntries",
+      "auditHead",
       "changeRole",
       "createTenant",
       "getSettings",
