@@ -28,7 +28,7 @@ export function ingestHarness(opts: { embedder?: Embedder; queue?: InMemoryQueue
 }
 
 /** Runs the queue until nothing is due, advancing the fake clock past any retry backoff. */
-export async function settle(h: { queue: InMemoryJobQueue; clock: FakeClock }, rounds = 10): Promise<void> {
+export async function settle(h: { queue: Pick<InMemoryJobQueue, "tick">; clock: FakeClock }, rounds = 10): Promise<void> {
   for (let i = 0; i < rounds; i++) {
     await h.queue.tick();
     h.clock.advance(60_000);

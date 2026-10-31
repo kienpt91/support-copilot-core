@@ -1,3 +1,4 @@
+import { redactStatic } from "../privacy/pii.js";
 import { ScopedCollection } from "../tenancy/scoped.js";
 import { Bm25Index } from "./bm25.js";
 import type { Embedder } from "./embedder.js";
@@ -101,11 +102,12 @@ export class HybridRetriever {
     const mode = opts.mode ?? "hybrid";
     const k = opts.k ?? 5;
     const idx = this.index(tenantId);
-    const queryTokens = tokenize(query);
+    const safeQuery = redactStatic(query); // PII never reaches the lexical index or an embedding model
+    const queryTokens = tokenize(safeQuery);
     const candidates = Math.max(k * (this.opts.candidateMultiplier ?? 5), 20);
 
     const needVector = mode !== "bm25";
-    const queryVector = needVector ? (await this.embedder.embed([query]))[0]! : null;
+    const queryVector = needVector ? (await this.embedder.embed([safeQuery]))[0]! : null;
 
     const bm25 = mode === "vector" ? [] : idx.bm25.search(queryTokens, candidates);
     const vec = queryVector && mode !== "bm25" ? idx.vectors.search(queryVector, candidates) : [];

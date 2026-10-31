@@ -58,3 +58,9 @@ export class PermanentJobError extends Error {
     this.name = "PermanentJobError";
   }
 }
+
+export class RateLimitedError extends AppError {
+  constructor(readonly retryAfterSeconds: number) {
+    super(429, "rate_limited", "Too many requests. Slow down and retry later.");
+  }
+}

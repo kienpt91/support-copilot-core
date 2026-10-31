@@ -212,7 +212,7 @@ describe("job queue", () => {
     let peak = 0;
     queue.setHandler("t", async () => {
       peak = Math.max(peak, ++active);
-      await new Promise((r) => setTimeout(r, 5));
+      for (let i = 0; i < 3; i++) await Promise.resolve(); // let the other job in the batch start
       active--;
     });
     for (let i = 0; i < 6; i++) queue.enqueue({ tenantId: "a", type: "t", payload: {} });
@@ -350,14 +350,24 @@ describe("ingestion service", () => {
     expect(h.retriever.chunkCount("t1")).toBe(0);
 
     const base = new HashingEmbedder(256);
-    let release: () => void = () => undefined;
-    const gate = new Promise<void>((r) => (release = r));
-    const slow = ingestHarness({ embedder: { id: base.id, dimensions: base.dimensions, embed: async (t) => { await gate; return base.embed(t); } } });
+    const gate = Promise.withResolvers<void>();
+    const embedStarted = Promise.withResolvers<void>();
+    const slow = ingestHarness({
+      embedder: {
+        id: base.id,
+        dimensions: base.dimensions,
+        embed: async (t) => {
+          embedStarted.resolve();
+          await gate.promise;
+          return base.embed(t);
+        },
+      },
+    });
     const doc = slow.service.submit(admin, { title: "S", content: "deleted mid-flight" });
     const running = slow.queue.tick();
-    await new Promise((r) => setTimeout(r, 5));
+    await embedStarted.promise;
     slow.service.delete(admin, doc.document.id);
-    release();
+    gate.resolve();
     await running;
     expect(slow.retriever.chunkCount("t1")).toBe(0);
     expect(slow.service.documents.count("t1")).toBe(0);
