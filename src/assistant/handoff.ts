@@ -38,6 +38,10 @@ export interface EscalationRecord {
   note: string | null;
 }
 
+/** Open items per tenant. Anonymous widget traffic can create these, so they are capped; closing or resolving frees room. */
+export const MAX_OPEN_TICKETS_PER_TENANT = 1000;
+export const MAX_OPEN_ESCALATIONS_PER_TENANT = 1000;
+
 /** Tickets and the human escalation queue, both tenant-scoped. */
 export class HandoffService {
   readonly tickets = new ScopedCollection<TicketRecord>("Ticket");
@@ -49,8 +53,20 @@ export class HandoffService {
     private readonly newId: IdGen = randomId,
   ) {}
 
+  /** True when the tenant already has the maximum number of open tickets. */
+  ticketQueueFull(tenantId: string): boolean {
+    return this.tickets.countWhere(tenantId, (t) => t.status === "open") >= MAX_OPEN_TICKETS_PER_TENANT;
+  }
+
+  /** True when an escalation can be opened (or already is open) for this conversation. */
+  canEscalate(tenantId: string, conversationId: string): boolean {
+    if (this.escalations.findBy(tenantId, (e) => e.conversationId === conversationId && e.status !== "resolved")) return true;
+    return this.escalations.countWhere(tenantId, (e) => e.status !== "resolved") < MAX_OPEN_ESCALATIONS_PER_TENANT;
+  }
+
   /** Called by the create_ticket tool; permission is enforced on the tool, not here. */
   createTicket(tenantId: string, input: { conversationId: string | null; subject: string; body: string; contact: string | null; createdBy: string }): TicketRecord {
+    if (this.ticketQueueFull(tenantId)) throw new ConflictError("The ticket queue is full.");
     const now = this.clock();
     return this.tickets.put(tenantId, {
       id: this.newId("tkt"),
@@ -90,6 +106,7 @@ export class HandoffService {
   ): { escalation: EscalationRecord; created: boolean } {
     const existing = this.escalations.findBy(tenantId, (e) => e.conversationId === input.conversationId && e.status !== "resolved");
     if (existing) return { escalation: existing, created: false };
+    if (!this.canEscalate(tenantId, input.conversationId)) throw new ConflictError("The escalation queue is full.");
     const now = this.clock();
     const escalation = this.escalations.put(tenantId, {
       id: this.newId("esc"),

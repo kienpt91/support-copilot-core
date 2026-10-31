@@ -83,9 +83,17 @@ export class ScopedCollection<T extends TenantOwned> {
   delete(tenantId: string, id: string): boolean {
     return this.partition(tenantId, false)?.delete(id) ?? false;
   }
-
   count(tenantId: string): number {
     return this.partition(tenantId, false)?.size ?? 0;
+  }
+
+  /** Number of records matching `predicate`, without cloning any of them. */
+  countWhere(tenantId: string, predicate: (record: T) => boolean): number {
+    const part = this.partition(tenantId, false);
+    if (!part) return 0;
+    let n = 0;
+    for (const record of part.values()) if (predicate(record)) n++;
+    return n;
   }
 
   clearTenant(tenantId: string): number {

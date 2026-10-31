@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
 import { composeAnswer, type EvidenceChunk } from "../src/assistant/compose.js";
 import { ExtractiveGenerator, type GenerateInput, type Generator, GeneratorError, INSUFFICIENT_EVIDENCE, OpenAiCompatibleGenerator } from "../src/assistant/generator.js";
-import { MAX_TURNS_PER_CONVERSATION } from "../src/assistant/chat.js";
+import { MAX_CONVERSATIONS_PER_TENANT, MAX_TURNS_PER_CONVERSATION } from "../src/assistant/chat.js";
 import { RuleBasedRouter } from "../src/assistant/router.js";
 import { ToolRegistry } from "../src/assistant/tools.js";
 import { MemoryAuditLog } from "../src/audit/chain.js";
-import { HandoffService } from "../src/assistant/handoff.js";
+import { HandoffService, MAX_OPEN_ESCALATIONS_PER_TENANT, MAX_OPEN_TICKETS_PER_TENANT } from "../src/assistant/handoff.js";
 import { createTicketTool } from "../src/assistant/tools.js";
 import { HashingEmbedder } from "../src/retrieval/embedder.js";
 import { ANSWER_THRESHOLD } from "../src/assistant/calibration.js";
@@ -543,5 +543,111 @@ describe("conversations", () => {
     const res = await chat("hello");
     expect(core.chat.getConversation(tenant.agent, res.conversationId).id).toBe(res.conversationId);
     expect(() => core.chat.getConversation({ ...tenant.agent, role: "agent" }, "nope")).toThrow(/not found/);
+  });
+});
+
+describe("concurrent requests in one conversation", () => {
+  it("keeps every turn when two requests for the same conversation overlap", async () => {
+    const { chat, core, tenant } = await setup();
+    const first = await chat("hello");
+    const results = await Promise.all([chat("How do I reset my password?", first.conversationId), chat("What is the API rate limit?", first.conversationId), chat("thanks", first.conversationId)]);
+    expect(results.map((r) => r.conversationId)).toEqual([first.conversationId, first.conversationId, first.conversationId]);
+    const turns = core.chat.getConversation(tenant.agent, first.conversationId).turns;
+    expect(turns).toHaveLength(4);
+    expect(turns.map((t) => t.userMessage)).toEqual(["hello", "How do I reset my password?", "What is the API rate limit?", "thanks"]);
+  });
+
+  it("cannot be used to slip past the turn cap", async () => {
+    const { chat, core, tenant } = await setup();
+    const first = await chat("hello");
+    for (let i = 1; i < MAX_TURNS_PER_CONVERSATION - 1; i++) await chat("thanks", first.conversationId);
+    const settled = await Promise.allSettled([chat("thanks", first.conversationId), chat("thanks", first.conversationId), chat("thanks", first.conversationId)]);
+    expect(settled.filter((s) => s.status === "fulfilled")).toHaveLength(1);
+    expect(settled.filter((s) => s.status === "rejected")).toHaveLength(2);
+    expect(core.chat.getConversation(tenant.agent, first.conversationId).turns).toHaveLength(MAX_TURNS_PER_CONVERSATION);
+  });
+
+  it("does not let a failing request block the next one for the same conversation", async () => {
+    const { chat } = await setup();
+    const first = await chat("hello");
+    const [bad, good] = await Promise.allSettled([chat("   ", first.conversationId), chat("thanks", first.conversationId)]);
+    expect(bad.status).toBe("rejected");
+    expect(good.status).toBe("fulfilled");
+  });
+
+  it("lets different conversations proceed independently", async () => {
+    const { chat } = await setup();
+    const [a, b] = await Promise.all([chat("hello"), chat("hello")]);
+    expect(a.conversationId).not.toBe(b.conversationId);
+  });
+});
+
+describe("caps on what anonymous widget traffic can create", () => {
+  it("stops opening tickets when the open-ticket queue is full, without writing audit entries, and resumes when one is closed", async () => {
+    const { chat, core, tenant } = await setup();
+    for (let i = 0; i < MAX_OPEN_TICKETS_PER_TENANT; i++) core.handoff.createTicket(tenant.id, { conversationId: null, subject: `s${i}`, body: `b${i}`, contact: null, createdBy: "test" });
+    const before = core.auditEntries(tenant.admin).length;
+    const res = await chat("Please open a ticket about my invoice not downloading");
+    expect(res).toMatchObject({ outcome: "queue_full", ticket: null });
+    expect(res.answer).toContain("queue is full");
+    expect(core.auditEntries(tenant.admin)).toHaveLength(before); // no tool.call entry for a call that was never made
+    expect(core.handoff.listTickets(tenant.agent)).toHaveLength(MAX_OPEN_TICKETS_PER_TENANT);
+    core.handoff.closeTicket(tenant.agent, core.handoff.listTickets(tenant.agent)[0]!.id);
+    expect((await chat("Please open a ticket about my invoice not downloading")).outcome).toBe("ticket_created");
+  });
+
+  it("stops opening escalations when the queue is full, but a conversation that already has one keeps it", async () => {
+    const { chat, core, tenant } = await setup();
+    const mine = await chat("I want to talk to a human");
+    for (let i = 1; i < MAX_OPEN_ESCALATIONS_PER_TENANT; i++) {
+      core.handoff.escalate(tenant.id, "test", { conversationId: `conv_filler_${i}`, reason: "low_confidence", summary: `s${i}` });
+    }
+    expect(core.handoff.listEscalations(tenant.agent, "open")).toHaveLength(MAX_OPEN_ESCALATIONS_PER_TENANT);
+    const again = await chat("please escalate this", mine.conversationId);
+    expect(again).toMatchObject({ outcome: "escalated", escalation: { id: mine.escalation!.id } });
+    const other = await chat("I want to talk to a human");
+    expect(other).toMatchObject({ outcome: "queue_full", escalation: null });
+    const refused = await chat("What is the weather in Berlin today?");
+    expect(refused.outcome).toBe("refused");
+    expect(refused.escalation).toBeNull();
+    expect(refused.answer).not.toContain("asked our support team");
+    expect(() => core.handoff.escalate(tenant.id, "test", { conversationId: "conv_overflow", reason: "user_request", summary: "x" })).toThrow(/queue is full/);
+  });
+
+  it("the ticket tool itself refuses when the queue is full", async () => {
+    const { core, tenant } = await setup();
+    for (let i = 0; i < MAX_OPEN_TICKETS_PER_TENANT; i++) core.handoff.createTicket(tenant.id, { conversationId: null, subject: "s", body: "b", contact: null, createdBy: "test" });
+    const res = await core.tools.call({ tenantId: tenant.id, conversationId: "c", actor: "k" }, "create_ticket", { subject: "s", body: "b" });
+    expect(res).toMatchObject({ ok: false });
+  });
+
+  it("drops the oldest conversations once a tenant reaches the cap, but keeps ones with an open escalation", async () => {
+    const { chat, core, tenant } = await setup();
+    const escalated = await chat("I want to talk to a human");
+    // Make the escalated conversation the oldest, then fill the tenant up to the cap.
+    core.chat.conversations.update(tenant.id, escalated.conversationId, { updatedAt: 1 });
+    const total = MAX_CONVERSATIONS_PER_TENANT - core.chat.conversations.count(tenant.id);
+    for (let i = 0; i < total; i++) {
+      core.chat.conversations.put(tenant.id, { id: `conv_f${i}`, tenantId: tenant.id, channel: "widget", createdAt: 10 + i, updatedAt: 10 + i, pendingTicket: false, turns: [] });
+    }
+    expect(core.chat.conversations.count(tenant.id)).toBe(MAX_CONVERSATIONS_PER_TENANT);
+    await chat("hello"); // creating one more triggers pruning
+    const after = core.chat.conversations.count(tenant.id);
+    expect(after).toBeLessThan(MAX_CONVERSATIONS_PER_TENANT);
+    expect(after).toBeGreaterThan(MAX_CONVERSATIONS_PER_TENANT - MAX_CONVERSATIONS_PER_TENANT / 10);
+    expect(core.chat.conversations.has(tenant.id, escalated.conversationId)).toBe(true);
+    expect(core.chat.conversations.has(tenant.id, "conv_f0")).toBe(false); // oldest without an escalation
+    expect(core.chat.conversations.has(tenant.id, `conv_f${total - 1}`)).toBe(true); // newest survives
+  });
+
+  it("pruning in one tenant never touches another tenant's conversations", async () => {
+    const { chat, core, tenant } = await setup();
+    const other = newTenant(core, "Other");
+    const theirs = await core.chat.handle(widgetPrincipal(other), { message: "hello" });
+    for (let i = 0; i < MAX_CONVERSATIONS_PER_TENANT; i++) {
+      core.chat.conversations.put(tenant.id, { id: `conv_f${i}`, tenantId: tenant.id, channel: "widget", createdAt: i, updatedAt: i, pendingTicket: false, turns: [] });
+    }
+    await chat("hello");
+    expect(core.chat.conversations.has(other.id, theirs.conversationId)).toBe(true);
   });
 });

@@ -1,6 +1,6 @@
 export { Core, type CoreOptions } from "./core.js";
 export { buildApp, type ApiOptions } from "./api/app.js";
-export { TokenBucketLimiter } from "./api/ratelimit.js";
+export { TokenBucketLimiter, clientKey } from "./api/ratelimit.js";
 
 export { type Actor, type Permission, type Role, can } from "./tenancy/roles.js";
 export { ScopedCollection } from "./tenancy/scoped.js";
@@ -10,6 +10,7 @@ export { type Tenant, type TenantSettings, TenantRegistry } from "./tenancy/regi
 export { InMemoryJobQueue, type Job, type JobEvent, type JobQueue } from "./ingest/queue.js";
 export { IngestService, type DocumentView } from "./ingest/service.js";
 export { chunkSections } from "./ingest/chunk.js";
+export { ProcessingBudget } from "./ingest/budget.js";
 export { htmlToText, parseDocument } from "./ingest/parse.js";
 
 export { Bm25Index } from "./retrieval/bm25.js";
@@ -26,6 +27,6 @@ export { calibrateThreshold, evaluateThreshold, retrievalConfidence } from "./as
 export { PiiVault } from "./privacy/vault.js";
 export { findPii, redactStatic } from "./privacy/pii.js";
 
-export { JsonlAuditLog, MemoryAuditLog, type AuditLog, verifyEntries, verifyJsonlFile } from "./audit/chain.js";
+export { AuditIntegrityError, JsonlAuditLog, MemoryAuditLog, type AuditLog, verifyEntries, verifyJsonlFile } from "./audit/chain.js";
 export { AnalyticsService } from "./analytics.js";
 export { runEval, type EvalReport } from "./eval/evaluate.js";

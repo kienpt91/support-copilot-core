@@ -24,6 +24,7 @@ describe("ScopedCollection: tenant isolation through every method", () => {
     update: (c) => expect(() => c.update("B", "x1", { label: "hacked" })).toThrow(NotFoundError),
     delete: (c) => expect(c.delete("B", "x1")).toBe(false),
     count: (c) => expect(c.count("B")).toBe(0),
+    countWhere: (c) => expect(c.countWhere("B", () => true)).toBe(0),
     clearTenant: (c) => expect(c.clearTenant("B")).toBe(0),
   };
 

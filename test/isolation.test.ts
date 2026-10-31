@@ -143,8 +143,20 @@ describe("isolation coverage guard", () => {
 
   it("lists every method of the services so new ones must be classified", () => {
     expect(publicMethods(IngestService)).toEqual(["delete", "getJob", "list", "listJobs", "process", "retryJob", "status", "submit"]);
-    expect(publicMethods(HandoffService)).toEqual(["claim", "closeTicket", "createTicket", "escalate", "getEscalation", "getTicket", "listEscalations", "listTickets", "resolve"]);
-    expect(publicMethods(ChatService)).toEqual(["answerQuestion", "getConversation", "handle", "listConversations"]);
+    expect(publicMethods(HandoffService)).toEqual([
+      "canEscalate",
+      "claim",
+      "closeTicket",
+      "createTicket",
+      "escalate",
+      "getEscalation",
+      "getTicket",
+      "listEscalations",
+      "listTickets",
+      "resolve",
+      "ticketQueueFull",
+    ]);
+    expect(publicMethods(ChatService)).toEqual(["answerQuestion", "getConversation", "handle", "listConversations", "process", "pruneConversations"]);
     expect(publicMethods(AnalyticsService)).toEqual(["summary", "timeseries", "unanswered"]);
     expect(publicMethods(ApiKeyService)).toEqual(["activeOwners", "authenticate", "authenticatePublic", "collection", "get", "issue", "list", "require", "revoke", "setRole"]);
     expect(publicMethods(HybridRetriever)).toEqual(["chunkCount", "commit", "index", "removeDocument", "search"]);
