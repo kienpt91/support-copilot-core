@@ -153,11 +153,25 @@ describe("overlaps and offsets", () => {
     expect(findPii("")).toEqual([]);
   });
 
-  it("stays fast on long adversarial input", () => {
-    const text = "1 ".repeat(20000) + "a".repeat(20000) + "@".repeat(5000);
-    const start = Date.now();
-    findPii(text);
-    expect(Date.now() - start).toBeLessThan(3000);
+  it("stays linear on long adversarial input", () => {
+    // CPU time for an input and one eight times larger (linear: about 8x, quadratic: about 64x); a wall-clock cap only measures the machine.
+    // Thread CPU time: V8's parallel GC threads spin on an oversubscribed machine and would inflate the process-wide figure.
+    const cpu = () => {
+      const used = typeof process.threadCpuUsage === "function" ? process.threadCpuUsage() : process.cpuUsage();
+      return (used.user + used.system) / 1000;
+    };
+    const cpuMs = (text: string) => {
+      let best = Infinity;
+      for (let i = 0; i < 5; i++) {
+        const before = cpu();
+        findPii(text);
+        best = Math.min(best, cpu() - before);
+      }
+      return best;
+    };
+    const text = (n: number) => "1 ".repeat(n) + "a".repeat(n) + "@".repeat(n / 4);
+    findPii(text(2500));
+    expect(cpuMs(text(20_000)) / Math.max(cpuMs(text(2500)), 10)).toBeLessThan(24);
   });
 });
 

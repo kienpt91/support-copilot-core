@@ -10,69 +10,97 @@ import { actorFor, ingestHarness } from "./helpers.js";
  * Regression tests for hostile document content. Each input below made the earlier regular-expression
  * based parser spend tens of seconds to minutes on the single thread that serves every tenant (measured
  * in a container: for example 51 s for 262,144 "[" characters, 71 s for "# " + 262,144 "#"). With the linear
- * scanners each finishes in tens of milliseconds. The limits here are deliberately generous (about 25 to 100
- * times the measured time on the machine they were written on) so slow CI machines pass; a return of
- * quadratic behaviour would miss them by orders of magnitude, not by a few percent.
+ * scanners each finishes in tens of milliseconds. The tests compare the CPU time for an input and one eight times
+ * larger instead of using a wall-clock cap: linear work gives a ratio of about 8, quadratic work about 64, and a slow
+ * or busy machine changes neither.
  */
 
 const MB = 990_000;
 
+/** `make(n)` builds a hostile document of about `n` bytes. */
 interface Hostile {
   name: string;
   format: DocFormat | "auto";
-  content: string;
+  make: (n: number) => string;
 }
 
 const HOSTILE: Hostile[] = [
-  { name: "unclosed comment openers", format: "markdown", content: "<!--".repeat(MB / 4) },
-  { name: "unclosed <script> openers", format: "markdown", content: "<script>".repeat(MB / 8) },
-  { name: "bracket openers", format: "markdown", content: "[".repeat(MB) },
-  { name: "unfinished links", format: "markdown", content: "[a](".repeat(MB / 4) },
-  { name: "unclosed emphasis", format: "markdown", content: " *a".repeat(MB / 3) },
-  { name: "heading with a hash run", format: "markdown", content: `# ${"#".repeat(MB)}x` },
-  { name: "long whitespace run before text", format: "markdown", content: `a${" ".repeat(MB)}x` },
-  { name: "html: long whitespace run", format: "html", content: `<p>a${" ".repeat(MB)}x</p>` },
-  { name: "html: unclosed <script> openers", format: "html", content: "<script>".repeat(MB / 8) },
-  { name: "html: closed <script> pairs", format: "html", content: "<script></script>".repeat(MB / 17) },
-  { name: "html: very many tags", format: "html", content: "<b>a</b>".repeat(MB / 8) },
-  { name: "auto: tag openers", format: "auto", content: "<a ".repeat(MB / 3) },
-  { name: "auto: newlines then text", format: "auto", content: `${"\n".repeat(MB)}x` },
-  { name: "single token of phone-like text", format: "text", content: "415-555-2671,".repeat(MB / 13) },
-  { name: "single 990 KB word", format: "text", content: "x".repeat(MB) },
+  { name: "unclosed comment openers", format: "markdown", make: (n) => "<!--".repeat(n / 4) },
+  { name: "unclosed <script> openers", format: "markdown", make: (n) => "<script>".repeat(n / 8) },
+  { name: "bracket openers", format: "markdown", make: (n) => "[".repeat(n) },
+  { name: "unfinished links", format: "markdown", make: (n) => "[a](".repeat(n / 4) },
+  { name: "unclosed emphasis", format: "markdown", make: (n) => " *a".repeat(n / 3) },
+  { name: "heading with a hash run", format: "markdown", make: (n) => `# ${"#".repeat(n)}x` },
+  { name: "long whitespace run before text", format: "markdown", make: (n) => `a${" ".repeat(n)}x` },
+  { name: "html: long whitespace run", format: "html", make: (n) => `<p>a${" ".repeat(n)}x</p>` },
+  { name: "html: unclosed <script> openers", format: "html", make: (n) => "<script>".repeat(n / 8) },
+  { name: "html: closed <script> pairs", format: "html", make: (n) => "<script></script>".repeat(n / 17) },
+  { name: "html: very many tags", format: "html", make: (n) => "<b>a</b>".repeat(n / 8) },
+  { name: "auto: tag openers", format: "auto", make: (n) => "<a ".repeat(n / 3) },
+  { name: "auto: newlines then text", format: "auto", make: (n) => `${"\n".repeat(n)}x` },
+  { name: "single token of phone-like text", format: "text", make: (n) => "415-555-2671,".repeat(n / 13) },
+  { name: "single 990 KB word", format: "text", make: (n) => "x".repeat(n) },
 ];
 
-async function parseAndChunk(h: Hostile): Promise<number> {
-  const started = performance.now();
+/** Parse and chunk; a rejection is fine (no text, too many chunks), what matters is the cost, which `growth` measures. */
+async function parseAndChunk(content: string, format: DocFormat | "auto"): Promise<void> {
   const budget = new ProcessingBudget(60_000);
   try {
-    const parsed = await parseDocument(h.content, h.format, budget);
+    const parsed = await parseDocument(content, format, budget);
     await chunkSections(parsed.sections, {}, budget);
   } catch (err) {
-    // Rejection is fine (no text, too many chunks); what matters is how long it took.
     expect((err as Error).name).toBe("PermanentJobError");
   }
-  return performance.now() - started;
+}
+
+/** An 8x larger input may cost at most this many times the CPU time of the small one: linear is about 8, quadratic about 64. */
+const MAX_GROWTH = 24;
+
+/**
+ * CPU microseconds of the calling thread. Not the whole process: V8's parallel garbage-collector threads spin while waiting when the
+ * machine is oversubscribed, which inflates process-wide CPU time for allocation-heavy (larger) inputs and has nothing to do with the code.
+ */
+function threadCpuMicros(): number {
+  const used = typeof process.threadCpuUsage === "function" ? process.threadCpuUsage() : process.cpuUsage();
+  return used.user + used.system;
+}
+
+/** CPU milliseconds used by `fn`; the best of five runs, so a busy machine does not inflate it. */
+async function cpuMs(fn: () => unknown): Promise<number> {
+  let best = Infinity;
+  for (let i = 0; i < 5; i++) {
+    const before = threadCpuMicros();
+    await fn();
+    best = Math.min(best, (threadCpuMicros() - before) / 1000);
+  }
+  return best;
+}
+
+/**
+ * CPU time of `fn` on `make(8 * n)` divided by its CPU time on `make(n)`. Unlike a wall-clock cap this does not depend on how fast or
+ * busy the machine is. The small time is floored at 10 ms so timer granularity and one-off hiccups cannot inflate the ratio.
+ */
+async function growth<T>(make: (size: number) => T, n: number, fn: (input: T) => unknown): Promise<number> {
+  const small = make(n);
+  const large = make(8 * n);
+  await fn(small);
+  return (await cpuMs(() => fn(large))) / Math.max(await cpuMs(() => fn(small)), 10);
 }
 
 describe("hostile document content is processed in linear time", () => {
-  it.each(HOSTILE.map((h) => [h.name, h] as const))("%s (about 1 MB) parses and chunks in well under a few seconds", async (_name, hostile) => {
-    expect(await parseAndChunk(hostile)).toBeLessThan(3000);
-  }, 30_000);
+  it.each(HOSTILE.map((h) => [h.name, h] as const))("%s (about 1 MB) parses and chunks in linear time", async (_name, hostile) => {
+    expect(await growth(hostile.make, MB / 8, (content) => parseAndChunk(content, hostile.format))).toBeLessThan(MAX_GROWTH);
+  }, 120_000);
 
-  it("detects the format of hostile 1 MB inputs quickly", () => {
-    for (const content of ["<a ".repeat(MB / 3), `${"\n".repeat(MB)}x`, "<".repeat(MB), "- ".repeat(MB / 2), `${" ".repeat(MB)}#`]) {
-      const started = performance.now();
-      detectFormat(content);
-      expect(performance.now() - started).toBeLessThan(500);
-    }
-  });
+  it("detects the format of hostile 1 MB inputs in linear time", async () => {
+    const inputs: Array<(n: number) => string> = [(n) => "<a ".repeat(n / 3), (n) => `${"\n".repeat(n)}x`, (n) => "<".repeat(n), (n) => "- ".repeat(n / 2), (n) => `${" ".repeat(n)}#`];
+    for (const make of inputs) expect(await growth(make, MB / 8, (content) => detectFormat(content))).toBeLessThan(MAX_GROWTH);
+  }, 120_000);
 
-  it("resolves PII overlaps in linear time: tens of thousands of phone numbers in one span", () => {
-    const started = performance.now();
-    const found = findPii("415-555-2671,".repeat(60_000));
-    expect(found).toHaveLength(60_000);
-    expect(performance.now() - started).toBeLessThan(3000);
-  });
+  it("resolves PII overlaps in linear time: tens of thousands of phone numbers in one span", async () => {
+    expect(findPii("415-555-2671,".repeat(60_000))).toHaveLength(60_000);
+    expect(await growth((n) => "415-555-2671,".repeat(n), 7500, (text) => findPii(text))).toBeLessThan(MAX_GROWTH);
+  }, 120_000);
 
   it("chunks a million-character token into bounded pieces instead of one giant chunk", async () => {
     const parsed = await parseDocument("a".repeat(500_000), "text");
@@ -84,12 +112,16 @@ describe("hostile document content is processed in linear time", () => {
 describe("one tenant's hostile document does not stall the others", () => {
   const admin = actorFor("t1", "admin");
 
-  /** Longest gap between ticks of a 1 ms timer while `work` runs: how long everything else was blocked. */
+  /**
+   * Most CPU time (ms) spent between two ticks of a 1 ms timer while `work` runs: how long everything else was blocked by work that
+   * never yielded. CPU time rather than elapsed time, so a busy machine that deschedules the process does not look like a stall.
+   */
   async function longestStall(work: () => Promise<void>): Promise<number> {
-    let last = performance.now();
+    const cpu = () => threadCpuMicros() / 1000;
+    let last = cpu();
     let worst = 0;
     const beat = setInterval(() => {
-      const now = performance.now();
+      const now = cpu();
       worst = Math.max(worst, now - last);
       last = now;
     }, 1);
