@@ -434,6 +434,7 @@ One case needed a closer look: the review suggested `1234567890.` repeated as a 
 
 - One runtime dependency (`fastify`) plus TypeScript, Vitest and `@types/node` for development. Versions are exact; `package-lock.json` covers all platforms' optional packages; every locked version, direct and transitive, was published on or before 2026-10-24. `npm ci --ignore-scripts` is used everywhere, so no dependency lifecycle scripts run.
 - CI (`.github/workflows/ci.yml`) runs typecheck, tests and build on Node 22 and 24 with a read-only token and no persisted credentials; actions are pinned to full commit SHAs. Dependabot opens weekly npm and Actions updates with a 7-day cooldown.
+- Releases: pushing a `v*` tag runs `.github/workflows/release.yml` (see [RELEASING.md](RELEASING.md)), which repeats the checks, builds the package, attests it and creates the GitHub release; it does not publish to npm.
 - Vulnerability reports: see `SECURITY.md`.
 
 ## Secrets and hooks
@@ -448,6 +449,10 @@ Install [lefthook](https://github.com/evilmartians/lefthook) and run `lefthook i
 CI also runs the tree scan and a full-history scan (`--history`). The scanner is a dependency-free POSIX shell script that looks for forbidden file names (such as `.env` or private key files) and for key-shaped values, and it never prints the matched value. A reviewed false positive can be allowed in `.secret-scan-allow` with one line per file and rule, `<path> <rule>   # reason`, or on a single line with the marker `secret-scan: allow`.
 
 If a secret is ever committed, rotate it first, treating it as compromised, and only then remove it from history.
+
+## Releasing
+
+Releases are cut by pushing a `vMAJOR.MINOR.PATCH` tag. The `release` workflow then verifies the code, builds the files, writes `SHA256SUMS`, attests where they were built and creates the GitHub release. See [RELEASING.md](RELEASING.md) for how to cut a release and how to verify a download with `gh attestation verify`.
 
 ## License
 
