@@ -12,6 +12,9 @@ import { ANSWER_THRESHOLD } from "../src/assistant/calibration.js";
 import { apiPrincipal, ingestCorpus, newCore, newTenant, widgetPrincipal } from "./helpers.js";
 
 const card = ["4111", "1111", "1111", "1111"].join(" ");
+/** The card number in any common spelling. Ids are random and may contain "4111" by chance, so match the whole number. */
+const CARD_NUMBER = /4111\D?1111\D?1111\D?1111/;
+const SENSITIVE = new RegExp(`${CARD_NUMBER.source}|charged twice`);
 
 class SpyGenerator implements Generator {
   readonly id = "spy";
@@ -227,14 +230,24 @@ describe("create_ticket tool", () => {
     const calls = core.auditEntries(tenant.admin).filter((e) => e.action === "tool.call");
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ target: "create_ticket", actor: "widget:pk-test", details: { tool: "create_ticket", ok: true, argKeys: ["subject", "body"] } });
-    expect(JSON.stringify(calls)).not.toMatch(/4111|charged twice/);
+    expect(JSON.stringify(calls)).not.toMatch(SENSITIVE);
+  });
+
+  it("does not mistake an id that happens to contain 4111 for leaked content", async () => {
+    let n = 0;
+    const { chat, core, tenant } = await setup({ newId: (prefix) => `${prefix}_x4111y${n++}` });
+    await chat("Please open a ticket about card 4111 1111 1111 1111 being charged twice");
+    const calls = core.auditEntries(tenant.admin).filter((e) => e.action === "tool.call");
+    expect(calls).toHaveLength(1);
+    expect(JSON.stringify(calls)).toContain("4111");
+    expect(JSON.stringify(calls)).not.toMatch(SENSITIVE);
   });
 
   it("redacts card numbers out of the ticket body", async () => {
     const { chat, core, tenant } = await setup();
     const res = await chat("Please open a ticket about card 4111 1111 1111 1111 being charged twice");
     const ticket = core.handoff.getTicket(tenant.agent, res.ticket!.id);
-    expect(JSON.stringify(ticket)).not.toContain("4111");
+    expect(JSON.stringify(ticket)).not.toMatch(CARD_NUMBER);
     expect(ticket.body).toContain("[CARD]");
   });
 });
